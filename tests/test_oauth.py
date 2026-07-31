@@ -403,3 +403,52 @@ class TestForwardedHeaders:
             "headers": [(b"host", b"v.example.com"), (b"x-forwarded-proto", b"https,http")],
         }
         assert http_app.request_origin(scope) == "https://v.example.com"
+
+
+class TestDiagnostics:
+    """The logs are the only window into a failed handshake in production."""
+
+    def test_fingerprint_is_stable_and_not_the_token(self):
+        a = http_app.token_fingerprint("secret-token")
+        assert a == http_app.token_fingerprint("secret-token")
+        assert a != http_app.token_fingerprint("other-token")
+        assert "secret-token" not in a
+        assert len(a) == 8
+
+    def test_describe_reads_claims_without_verifying(self, keypair):
+        token = make_token(keypair, aud="https://wrong.example.com")
+        described = http_app.describe_token(token)
+        assert "https://wrong.example.com" in described
+        assert ISSUER in described
+
+    def test_describe_handles_opaque_tokens(self):
+        """Auth0 issues an opaque token when the resource param is ignored."""
+        assert "opaque-or-malformed" in http_app.describe_token("not-a-jwt")
+
+    def test_rejection_is_logged_with_both_sides(self, vault, keypair, caplog):
+        _, public = keypair
+        stub = type(
+            "S", (), {"get_signing_key_from_jwt": lambda self, t: type("K", (), {"key": public})()}
+        )()
+        config = oauth.OAuthConfig(issuer=ISSUER)
+        app = http_app.build_app(
+            oauth_config=config, verifier=oauth.TokenVerifier(config, jwk_client=stub)
+        )
+
+        async def scenario():
+            import httpx2
+
+            async with Server(app) as srv:
+                bad = make_token(keypair, aud="https://wrong.example.com/p/x/mcp")
+                async with httpx2.AsyncClient() as client:
+                    return await client.post(
+                        srv.url("decision-tree"),
+                        json={},
+                        headers={"Authorization": f"Bearer {bad}"},
+                    )
+
+        with caplog.at_level("WARNING", logger="context-vault.auth"):
+            assert run(scenario()).status_code == 401
+        logged = caplog.text
+        assert "wrong.example.com" in logged, "should record what the token claimed"
+        assert "decision-tree" in logged, "should record what was expected"

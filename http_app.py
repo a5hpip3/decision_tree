@@ -17,6 +17,7 @@ affinity if this ever runs on more than one replica.
 
 from __future__ import annotations
 
+import logging
 import os
 import secrets
 
@@ -27,6 +28,33 @@ from starlette.routing import Route
 
 import oauth
 import server
+
+log = logging.getLogger("context-vault.auth")
+
+
+def token_fingerprint(token: str) -> str:
+    """Enough to correlate a token across log lines, useless for replay."""
+    import hashlib
+
+    return hashlib.sha256(token.encode()).hexdigest()[:8]
+
+
+def describe_token(token: str) -> str:
+    """Unverified peek at a JWT's claims, for diagnostics only.
+
+    Deliberately does not validate anything — the point is to explain *why*
+    verification failed, which means reading what the token actually claims.
+    """
+    try:
+        import jwt as _jwt
+
+        claims = _jwt.decode(token, options={"verify_signature": False})
+    except Exception:
+        return "opaque-or-malformed (not a readable JWT)"
+    return (
+        f"iss={claims.get('iss')!r} aud={claims.get('aud')!r} "
+        f"sub={claims.get('sub')!r} scope={claims.get('scope')!r}"
+    )
 
 MCP_SUFFIX = "/mcp"
 PREFIX = "/p/"
@@ -154,15 +182,38 @@ def build_app(
             return None
         presented = _bearer(scope)
         if presented is None:
+            log.warning("auth: no credential for project=%s", project)
             return "no bearer credential presented"
         if token is not None and secrets.compare_digest(presented, token):
             return None
         if oauth_config is None:
+            log.warning("auth: static token mismatch for project=%s", project)
             return "invalid token"
+
+        expected = resource_url_for(scope, project)
         try:
-            await verifier.verify(presented, resource_url_for(scope, project))
+            claims = await verifier.verify(presented, expected)
         except oauth.AuthError as exc:
+            # Log what the token claimed next to what we required — an audience
+            # or issuer mismatch is otherwise indistinguishable from a bad
+            # signature in the access log.
+            log.warning(
+                "auth: rejected token=%s project=%s reason=%s | expected aud=%r "
+                "iss=%r | presented %s",
+                token_fingerprint(presented),
+                project,
+                exc,
+                oauth_config.audience or expected,
+                oauth_config.issuer_url,
+                describe_token(presented),
+            )
             return str(exc)
+        log.info(
+            "auth: accepted token=%s project=%s sub=%s",
+            token_fingerprint(presented),
+            project,
+            claims.get("sub"),
+        )
         return None
 
     async def app(scope, receive, send):
@@ -255,6 +306,11 @@ app = build_app(
 
 if __name__ == "__main__":
     import uvicorn
+
+    logging.basicConfig(
+        level=os.environ.get("CONTEXT_VAULT_LOG_LEVEL", "INFO"),
+        format="%(levelname)s %(name)s %(message)s",
+    )
 
     uvicorn.run(
         app,
