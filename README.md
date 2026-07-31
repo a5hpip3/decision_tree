@@ -206,11 +206,19 @@ Add this to your project's `CLAUDE.md` (or Cursor rules):
 |---|---|
 | `log_decision` | Capture a decision + reasoning + transcript citation |
 | `supersede_decision` | Record a reversal; old decision kept in timeline |
+| `retire_decision` | Mark a decision as filed against the wrong project |
 | `list_decisions` | Timeline view (pass `include_superseded=true` for history) |
 | `get_decision` | Full record incl. the citation excerpt |
 | `get_project_brief` | The "catch me up" view — all active decisions |
 
-All five operate on the current project's vault only — see [Storage](#storage).
+All six operate on the current project's vault only — see [Storage](#storage).
+
+**Supersede vs retire.** A superseded decision was real and then changed — it
+stays part of the project's story. A *retired* decision never belonged here at
+all, typically because a client was pointed at the wrong project URL. Retiring
+drops it from the brief and the default timeline while keeping the full record,
+with a reason attached, under `include_superseded=true`. Neither deletes
+anything; the log remains append-only.
 
 ## Tests
 

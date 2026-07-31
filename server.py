@@ -40,13 +40,15 @@ mcp = Server(
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS decisions (
-    id            INTEGER PRIMARY KEY AUTOINCREMENT,
-    summary       TEXT NOT NULL,
-    reasoning     TEXT NOT NULL,
-    excerpt       TEXT NOT NULL,
-    created_at    TEXT NOT NULL,
-    supersedes    INTEGER REFERENCES decisions(id),
-    superseded_by INTEGER REFERENCES decisions(id)
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    summary        TEXT NOT NULL,
+    reasoning      TEXT NOT NULL,
+    excerpt        TEXT NOT NULL,
+    created_at     TEXT NOT NULL,
+    supersedes     INTEGER REFERENCES decisions(id),
+    superseded_by  INTEGER REFERENCES decisions(id),
+    retired_at     TEXT,
+    retired_reason TEXT
 );
 
 CREATE TABLE IF NOT EXISTS meta (
@@ -54,6 +56,13 @@ CREATE TABLE IF NOT EXISTS meta (
     value TEXT NOT NULL
 );
 """
+
+# Columns added after the first release. CREATE TABLE IF NOT EXISTS silently
+# leaves an existing table alone, so they have to be added explicitly.
+ADDED_COLUMNS = (("retired_at", "TEXT"), ("retired_reason", "TEXT"))
+
+# A decision is shown by default only while it is neither replaced nor retired.
+ACTIVE = "superseded_by IS NULL AND retired_at IS NULL"
 
 VAULT_HOME = Path(
     os.environ.get("CONTEXT_VAULT_HOME") or Path.home() / ".context-vault"
@@ -131,6 +140,7 @@ def connect() -> sqlite3.Connection:
     conn = sqlite3.connect(path)
     conn.row_factory = sqlite3.Row
     conn.executescript(SCHEMA)
+    migrate(conn)
     with conn:
         # Records which project a hashed filename belongs to. INSERT OR IGNORE
         # so the value reflects where the vault was created, not wherever it
@@ -160,10 +170,30 @@ def now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
+def migrate(conn: sqlite3.Connection) -> None:
+    """Bring an existing vault up to the current schema.
+
+    Vaults are long-lived files on disk and predate columns added later, so a
+    missing column is normal, not an error.
+    """
+    existing = {row["name"] for row in conn.execute("PRAGMA table_info(decisions)")}
+    with conn:
+        for name, decl in ADDED_COLUMNS:
+            if name not in existing:
+                conn.execute(f"ALTER TABLE decisions ADD COLUMN {name} {decl}")
+
+
 def format_decision(row: sqlite3.Row, full: bool = False) -> str:
-    status = f"SUPERSEDED by #{row['superseded_by']}" if row["superseded_by"] else "active"
+    if row["retired_at"]:
+        status = "RETIRED"
+    elif row["superseded_by"]:
+        status = f"SUPERSEDED by #{row['superseded_by']}"
+    else:
+        status = "active"
     lines = [f"#{row['id']} [{status}] {row['created_at']}"]
     lines.append(f"  Decision: {row['summary']}")
+    if row["retired_at"]:
+        lines.append(f"  Retired {row['retired_at']}: {row['retired_reason']}")
     if full:
         lines.append(f"  Reasoning: {row['reasoning']}")
         if row["supersedes"]:
@@ -218,6 +248,12 @@ def supersede_decision(decision_id: int, summary: str, reasoning: str, excerpt: 
                 f"Error: decision #{decision_id} was already superseded by "
                 f"#{old['superseded_by']}. Supersede that one instead."
             )
+        if old["retired_at"]:
+            return (
+                f"Error: decision #{decision_id} was retired as filed in error "
+                f"({old['retired_reason']}). A retired decision is not part of "
+                "this project's history, so there is nothing to supersede."
+            )
         cur = conn.execute(
             "INSERT INTO decisions (summary, reasoning, excerpt, created_at, supersedes)"
             " VALUES (?, ?, ?, ?, ?)",
@@ -234,6 +270,39 @@ def supersede_decision(decision_id: int, summary: str, reasoning: str, excerpt: 
 
 
 @mcp.tool()
+def retire_decision(decision_id: int, reason: str) -> str:
+    """Mark a decision as filed in error, without deleting it.
+
+    Use only when a decision does not belong in this project at all — for
+    example it was logged against the wrong project. It leaves the brief and
+    the default timeline but stays in the full history with the reason
+    attached. Nothing is destroyed.
+
+    This is not for decisions that turned out to be wrong or were changed —
+    that is what supersede_decision is for, and a superseded decision remains
+    a real part of this project's story.
+
+    Args:
+        decision_id: The id of the decision to retire.
+        reason: Why it does not belong here, e.g. where it was moved to.
+    """
+    with closing(connect()) as conn, conn:
+        row = conn.execute("SELECT * FROM decisions WHERE id = ?", (decision_id,)).fetchone()
+        if row is None:
+            return f"Error: no decision #{decision_id}. Use list_decisions to find the right id."
+        if row["retired_at"]:
+            return (
+                f"Error: decision #{decision_id} was already retired "
+                f"({row['retired_at']}: {row['retired_reason']})."
+            )
+        conn.execute(
+            "UPDATE decisions SET retired_at = ?, retired_reason = ? WHERE id = ?",
+            (now(), reason, decision_id),
+        )
+    return f"Retired decision #{decision_id}: {row['summary']}"
+
+
+@mcp.tool()
 def list_decisions(include_superseded: bool = False) -> str:
     """List this project's decision timeline, newest first.
 
@@ -243,7 +312,7 @@ def list_decisions(include_superseded: bool = False) -> str:
     """
     query = "SELECT * FROM decisions"
     if not include_superseded:
-        query += " WHERE superseded_by IS NULL"
+        query += f" WHERE {ACTIVE}"
     query += " ORDER BY id DESC"
     with closing(connect()) as conn:
         rows = conn.execute(query).fetchall()
@@ -277,10 +346,14 @@ def get_project_brief() -> str:
     label = project_label()
     with closing(connect()) as conn:
         rows = conn.execute(
-            "SELECT * FROM decisions WHERE superseded_by IS NULL ORDER BY id"
+            f"SELECT * FROM decisions WHERE {ACTIVE} ORDER BY id"
         ).fetchall()
         superseded = conn.execute(
-            "SELECT COUNT(*) FROM decisions WHERE superseded_by IS NOT NULL"
+            "SELECT COUNT(*) FROM decisions"
+            " WHERE superseded_by IS NOT NULL AND retired_at IS NULL"
+        ).fetchone()[0]
+        retired = conn.execute(
+            "SELECT COUNT(*) FROM decisions WHERE retired_at IS NOT NULL"
         ).fetchone()[0]
     if not rows:
         return (
@@ -291,9 +364,14 @@ def get_project_brief() -> str:
     for row in rows:
         parts.append(f"- #{row['id']} ({row['created_at']}): {row['summary']}")
         parts.append(f"  Why: {row['reasoning']}")
-    if superseded:
+    if superseded or retired:
+        counts = []
+        if superseded:
+            counts.append(f"{superseded} superseded decision(s)")
+        if retired:
+            counts.append(f"{retired} retired (filed in error)")
         parts.append(
-            f"\n({superseded} superseded decision(s) in history — "
+            f"\n({' and '.join(counts)} in history — "
             "list_decisions with include_superseded=true to see them.)"
         )
     return "\n".join(parts)

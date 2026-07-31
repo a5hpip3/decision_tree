@@ -450,6 +450,7 @@ def test_all_tools_are_registered():
     assert tools == {
         "log_decision",
         "supersede_decision",
+        "retire_decision",
         "list_decisions",
         "get_decision",
         "get_project_brief",
