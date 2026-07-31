@@ -131,7 +131,14 @@ def project_identity() -> str:
 def project_label() -> str:
     """Human-readable project name for briefs and empty-vault messages."""
     remote = REMOTE_PROJECT.get()
-    return remote if remote is not None else project_root().name
+    if remote is not None:
+        return remote
+    # Imported lazily: onboarding reads this module, so a top-level import
+    # would be circular.
+    import onboarding
+
+    root = project_root()
+    return onboarding.read_declared_name(root) or root.name
 
 
 def connect() -> sqlite3.Connection:
@@ -150,6 +157,21 @@ def connect() -> sqlite3.Connection:
             (project_identity(),),
         )
     return conn
+
+
+def history_note(superseded: int, retired: int) -> str:
+    """Trailing note about decisions held back from the brief."""
+    counts = []
+    if superseded:
+        counts.append(f"{superseded} superseded decision(s)")
+    if retired:
+        counts.append(f"{retired} retired (filed in error)")
+    if not counts:
+        return ""
+    return (
+        f"\n({' and '.join(counts)} in history — "
+        "list_decisions with include_superseded=true to see them.)"
+    )
 
 
 def empty_vault_note() -> str:
@@ -355,26 +377,151 @@ def get_project_brief() -> str:
         retired = conn.execute(
             "SELECT COUNT(*) FROM decisions WHERE retired_at IS NOT NULL"
         ).fetchone()[0]
+    history = history_note(superseded, retired)
     if not rows:
-        return (
-            f"No decisions logged yet — {label} has no recorded history."
-            f"{empty_vault_note()}"
-        )
+        # Nothing at all in the vault means this is a first contact, and the
+        # cheapest moment to catch a client pointed at the wrong project. A
+        # vault whose decisions were all superseded or retired is not that.
+        if not superseded and not retired:
+            return (
+                f"No decisions logged yet — {label} has no recorded history."
+                f"\n\n(First run for {label} — call `setup` to confirm this is "
+                "the right project and see how to turn on capture.)"
+                f"{empty_vault_note()}"
+            )
+        # Everything here was superseded or retired, so this is emphatically
+        # not a first run — say what is being held back instead.
+        return f"No active decisions for {label}.{history}{empty_vault_note()}"
     parts = [f"# Project brief — {label}\n", "Active decisions:\n"]
     for row in rows:
         parts.append(f"- #{row['id']} ({row['created_at']}): {row['summary']}")
         parts.append(f"  Why: {row['reasoning']}")
-    if superseded or retired:
-        counts = []
-        if superseded:
-            counts.append(f"{superseded} superseded decision(s)")
-        if retired:
-            counts.append(f"{retired} retired (filed in error)")
-        parts.append(
-            f"\n({' and '.join(counts)} in history — "
-            "list_decisions with include_superseded=true to see them.)"
-        )
+    if history:
+        parts.append(history)
     return "\n".join(parts)
+
+
+@mcp.tool()
+def setup() -> str:
+    """Show where this client is connected and how to finish setting it up.
+
+    Call this on first use, or whenever it is not obvious which project the
+    decisions being logged will belong to.
+    """
+    import onboarding
+
+    return onboarding.report(onboarding.vault_state())
+
+
+@mcp.tool()
+async def name_project(name: str = "", ctx=None) -> str:
+    """Set the canonical name for this project, written to a .context-vault file.
+
+    The name is what the hosted connector URL uses and what briefs are titled
+    with. It does not move any existing local vault: local history stays keyed
+    to the directory's path, so naming a project later never loses decisions.
+
+    Args:
+        name: The name to use. Must match ^[a-z0-9][a-z0-9._-]{0,63}$. Leave
+            empty to be asked interactively, where the client supports it.
+    """
+    import onboarding
+
+    if REMOTE_PROJECT.get() is not None:
+        return (
+            "This client is connected over HTTP, where the project comes from "
+            "the connector URL. Change the /p/<project>/mcp segment in the "
+            "connector settings instead."
+        )
+
+    root = project_root()
+    suggested = onboarding.suggest_name(root)
+
+    if not name:
+        name = await _ask_for_name(ctx, suggested)
+        if not name:
+            return (
+                f"Not set. Call name_project with a name, or create "
+                f"{onboarding.declaration_path(root)} containing "
+                f'{{"project": "{suggested}"}}. Suggested: {suggested}'
+            )
+
+    if not PROJECT_NAME.match(name):
+        return (
+            f"Error: {name!r} is not a valid project name. It must match "
+            f"{PROJECT_NAME.pattern} — lowercase letters, digits, dot, "
+            f"underscore or hyphen, starting with a letter or digit. "
+            f"Suggested: {suggested}"
+        )
+
+    path = onboarding.write_declared_name(root, name)
+    return (
+        f"Project named {name!r} (written to {path}). Briefs will use this "
+        f"name, and the hosted connector URL for it would be "
+        f"/p/{name}/mcp. Existing local history is unaffected."
+    )
+
+
+async def _ask_for_name(ctx, suggested: str) -> str:
+    """Ask the user via MCP elicitation; empty string if that isn't possible.
+
+    Elicitation is optional in the protocol and unsupported by most clients
+    today, so every failure path here is expected rather than exceptional.
+    """
+    if ctx is None:
+        return ""
+    try:
+        import mcp.types as types
+
+        connection = ctx.connection
+        if not connection.check_capability(
+            types.ClientCapabilities(elicitation=types.ElicitationCapability())
+        ):
+            return ""
+        result = await connection.send_request(
+            types.ElicitRequest(
+                method="elicitation/create",
+                params=types.ElicitRequestFormParams(
+                    message=(
+                        "What should this project be called? This names its "
+                        "decision history and its hosted connector URL."
+                    ),
+                    requestedSchema={
+                        "type": "object",
+                        "properties": {
+                            "project": {
+                                "type": "string",
+                                "title": "Project name",
+                                "description": (
+                                    "Lowercase letters, digits, . _ - "
+                                    f"(suggested: {suggested})"
+                                ),
+                                "default": suggested,
+                            }
+                        },
+                        "required": ["project"],
+                    },
+                ),
+            ),
+            result_type=types.ElicitResult,
+        )
+        if result.action != "accept" or not result.content:
+            return ""
+        return str(result.content.get("project", "")).strip()
+    except Exception:
+        # Any transport, capability or validation problem means "ask in text".
+        return ""
+
+
+@mcp.prompt(
+    name="setup",
+    title="Context Vault setup",
+    description="Show which project this is connected to and how to finish setup.",
+)
+def setup_prompt() -> str:
+    import onboarding
+
+    return onboarding.report(onboarding.vault_state())
 
 
 if __name__ == "__main__":

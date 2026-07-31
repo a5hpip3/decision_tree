@@ -454,6 +454,8 @@ def test_all_tools_are_registered():
         "list_decisions",
         "get_decision",
         "get_project_brief",
+        "setup",
+        "name_project",
     }
 
 

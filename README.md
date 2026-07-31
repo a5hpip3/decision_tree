@@ -189,6 +189,46 @@ a misleading "Couldn't reach the MCP server".
 Never put the token in the URL — Anthropic's docs and the MCP spec both
 prohibit credentials in query strings, and this server never reads one.
 
+## Onboarding
+
+Run `setup` — as a tool ("run context vault setup") or, in Claude Code and
+Desktop, as the `/setup` prompt. It reports what actually matters before
+anything is captured:
+
+```
+Connected over : local (stdio)
+Project        : fresh-project
+                 (from the git root directory name)
+Writing to     : ~/.context-vault/projects/fresh-project-1e083d.db
+Status         : 0 active decision(s), 0 total
+```
+
+followed by four steps: confirm the project, choose local or hosted, paste the
+capture instruction, verify. A vault with nothing in it also appends a one-line
+pointer to `setup` on the first `get_project_brief`.
+
+Leading with the resolved project is deliberate. The one real failure mode seen
+so far is a client pointed at the wrong project — decisions land in a vault that
+looks fine until you read it. Naming it up front is cheaper than moving and
+retiring them afterwards.
+
+### Naming a project
+
+`name_project` writes `.context-vault` at the repo root:
+
+```json
+{ "project": "rapid_manufacturing" }
+```
+
+That name titles briefs and is the name to use in a hosted connector URL. It
+does **not** move an existing local vault — local history stays keyed to the
+directory's absolute path, so naming a project later can never orphan
+decisions already logged. Commit the file to share the name with the team.
+
+Called with no argument, `name_project` asks interactively via MCP elicitation
+where the client supports it, and otherwise explains how to set it in text —
+which is the common path, since few clients implement elicitation today.
+
 ## The one instruction that makes it work
 
 Add this to your project's `CLAUDE.md` (or Cursor rules):
@@ -210,6 +250,8 @@ Add this to your project's `CLAUDE.md` (or Cursor rules):
 | `list_decisions` | Timeline view (pass `include_superseded=true` for history) |
 | `get_decision` | Full record incl. the citation excerpt |
 | `get_project_brief` | The "catch me up" view — all active decisions |
+| `setup` | Where am I connected, and what's left to configure |
+| `name_project` | Pin this repo's canonical name (writes `.context-vault`) |
 
 All six operate on the current project's vault only — see [Storage](#storage).
 
