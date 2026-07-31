@@ -25,24 +25,11 @@ from starlette.applications import Starlette
 from starlette.responses import JSONResponse, PlainTextResponse
 from starlette.routing import Route
 
+import oauth
 import server
 
 MCP_SUFFIX = "/mcp"
 PREFIX = "/p/"
-
-
-def _unauthorized() -> JSONResponse:
-    # Deliberately no WWW-Authenticate header. Claude reads `401` +
-    # `WWW-Authenticate: Bearer` as an OAuth challenge and goes looking for
-    # protected-resource metadata, probing /.well-known/oauth-protected-resource*
-    # and failing with a misleading "Couldn't reach the MCP server". This server
-    # authenticates with a static header (Anthropic's `static_headers` mode),
-    # not OAuth, so a bare 401 gives an honest error instead.
-    # https://claude.com/docs/connectors/building/authentication
-    return JSONResponse(
-        {"error": "unauthorized", "hint": "set the Authorization request header"},
-        status_code=401,
-    )
 
 
 def parse_project(path: str) -> str | None:
@@ -58,6 +45,31 @@ def parse_project(path: str) -> str | None:
     if not server.PROJECT_NAME.match(name):
         return None
     return name
+
+
+WELL_KNOWN_PRM = "/.well-known/oauth-protected-resource"
+
+
+def request_origin(scope) -> str:
+    """The externally visible scheme://host, honouring the platform's proxy.
+
+    Behind Railway the app speaks plain HTTP, so scope["scheme"] says `http`
+    while clients reached us over HTTPS. Advertising an http:// resource URL
+    would not match what the user entered, and Claude rejects the metadata.
+    """
+    headers = {k.decode(): v.decode() for k, v in scope.get("headers", [])}
+    host = headers.get("x-forwarded-host") or headers.get("host", "")
+    scheme = headers.get("x-forwarded-proto") or scope.get("scheme", "http")
+    return f"{scheme.split(',')[0].strip()}://{host}"
+
+
+def resource_url_for(scope, project: str) -> str:
+    return f"{request_origin(scope)}{PREFIX}{project}{MCP_SUFFIX}"
+
+
+def metadata_url_for(scope, project: str) -> str:
+    """Per-project metadata location, mirroring the MCP path underneath it."""
+    return f"{request_origin(scope)}{WELL_KNOWN_PRM}{PREFIX}{project}{MCP_SUFFIX}"
 
 
 async def health(_request):
@@ -97,20 +109,61 @@ def transport_security(allowed_hosts: str | None) -> TransportSecuritySettings |
     )
 
 
-def build_app(token: str | None = None, allowed_hosts: str | None = None):
+def build_app(
+    token: str | None = None,
+    allowed_hosts: str | None = None,
+    oauth_config: oauth.OAuthConfig | None = None,
+    verifier: oauth.TokenVerifier | None = None,
+):
     """ASGI app routing /p/<project>/mcp to the MCP server.
 
-    token: if set, every /p/... request must present it as a bearer token.
-    Health and index stay open so platform health checks work unauthenticated.
-    allowed_hosts: see transport_security().
+    token: if set, a request may authenticate with this static bearer token.
+    oauth_config: if set, a request may instead present a JWT from that issuer,
+        and the server advertises RFC 9728 metadata so clients can obtain one.
+    Either credential is sufficient; with neither configured the server is open.
+    Health, index and the metadata documents stay unauthenticated by design.
     """
     mcp_app = server.mcp.streamable_http_app(
         stateless_http=True,
         transport_security=transport_security(allowed_hosts),
     )
+    if oauth_config and verifier is None:
+        verifier = oauth.TokenVerifier(oauth_config)
 
     routes = [Route("/", index), Route("/healthz", health)]
     shell = Starlette(routes=routes)
+
+    async def deny(scope, receive, send, project, error=None):
+        headers = {}
+        if oauth_config:
+            headers["WWW-Authenticate"] = oauth.challenge_header(
+                metadata_url_for(scope, project), error
+            )
+        # With only a static token there is no OAuth flow to start, so the
+        # challenge header is omitted rather than sending clients hunting for
+        # metadata that does not exist.
+        await JSONResponse(
+            {"error": "unauthorized", "error_description": error or "credential required"},
+            status_code=401,
+            headers=headers,
+        )(scope, receive, send)
+
+    async def authorize(scope, project) -> str | None:
+        """None if the request may proceed, else a reason to reject it."""
+        if token is None and oauth_config is None:
+            return None
+        presented = _bearer(scope)
+        if presented is None:
+            return "no bearer credential presented"
+        if token is not None and secrets.compare_digest(presented, token):
+            return None
+        if oauth_config is None:
+            return "invalid token"
+        try:
+            await verifier.verify(presented, resource_url_for(scope, project))
+        except oauth.AuthError as exc:
+            return str(exc)
+        return None
 
     async def app(scope, receive, send):
         if scope["type"] != "http":
@@ -120,6 +173,11 @@ def build_app(token: str | None = None, allowed_hosts: str | None = None):
             return
 
         path = scope["path"]
+
+        if path.startswith(WELL_KNOWN_PRM):
+            await _metadata_response(scope, receive, send, path, oauth_config)
+            return
+
         if not path.startswith(PREFIX):
             await shell(scope, receive, send)
             return
@@ -132,8 +190,9 @@ def build_app(token: str | None = None, allowed_hosts: str | None = None):
             )(scope, receive, send)
             return
 
-        if token is not None and not _authorized(scope, token):
-            await _unauthorized()(scope, receive, send)
+        reason = await authorize(scope, project)
+        if reason is not None:
+            await deny(scope, receive, send, project, reason)
             return
 
         # Hand the MCP app the path it expects, and publish the project for the
@@ -148,16 +207,49 @@ def build_app(token: str | None = None, allowed_hosts: str | None = None):
     return app
 
 
-def _authorized(scope, token: str) -> bool:
+def _bearer(scope) -> str | None:
+    """The credential from an `Authorization: Bearer <value>` header."""
     for key, value in scope.get("headers", []):
         if key == b"authorization":
-            return secrets.compare_digest(value.strip(), f"Bearer {token}".encode())
-    return False
+            raw = value.decode("latin-1").strip()
+            scheme, _, rest = raw.partition(" ")
+            if scheme.lower() == "bearer" and rest.strip():
+                return rest.strip()
+            return None
+    return None
+
+
+async def _metadata_response(scope, receive, send, path, oauth_config):
+    """Serve RFC 9728 metadata for /p/<project>/mcp, or 404 when OAuth is off."""
+    if oauth_config is None:
+        await JSONResponse({"error": "oauth not configured"}, status_code=404)(
+            scope, receive, send
+        )
+        return
+
+    suffix = path[len(WELL_KNOWN_PRM) :]
+    # Claude probes the path-suffixed document first, then the bare one.
+    project = parse_project(suffix) if suffix else None
+    if project is None and suffix not in ("", "/"):
+        await JSONResponse({"error": "unknown resource"}, status_code=404)(
+            scope, receive, send
+        )
+        return
+
+    resource = (
+        resource_url_for(scope, project)
+        if project
+        else f"{request_origin(scope)}{PREFIX}<project>{MCP_SUFFIX}"
+    )
+    await JSONResponse(oauth.protected_resource_metadata(resource, oauth_config))(
+        scope, receive, send
+    )
 
 
 app = build_app(
     token=os.environ.get("CONTEXT_VAULT_TOKEN") or None,
     allowed_hosts=os.environ.get("CONTEXT_VAULT_ALLOWED_HOSTS") or None,
+    oauth_config=oauth.OAuthConfig.from_env(os.environ),
 )
 
 

@@ -121,6 +121,52 @@ the mount itself.
 The domain is needed *before* the server will answer, but only exists *after*
 the first deploy, so the sequence above deploys twice on purpose.
 
+### OAuth with Auth0
+
+Context Vault never issues tokens. It is a *protected resource*: Auth0 is the
+authorization server, and this server verifies the JWTs Auth0 mints.
+
+| Env var | Purpose |
+|---|---|
+| `CONTEXT_VAULT_OAUTH_ISSUER` | Auth0 tenant URL, e.g. `https://you.us.auth0.com/`. Setting it turns OAuth on |
+| `CONTEXT_VAULT_OAUTH_AUDIENCE` | Pin the expected `aud`. Leave unset to require the per-project URL |
+| `CONTEXT_VAULT_OAUTH_SCOPES` | Space-separated scopes every token must carry |
+
+With OAuth on, the server:
+
+- serves RFC 9728 metadata at `/.well-known/oauth-protected-resource/p/<project>/mcp`,
+  whose `resource` is the exact URL the user entered (Claude rejects it otherwise)
+- answers unauthenticated calls with `401` +
+  `WWW-Authenticate: Bearer resource_metadata="…"`, pointing straight at that
+  document so the client doesn't have to probe for it
+- verifies RS256 signatures against the tenant JWKS, checking `iss`, `aud`,
+  `exp`, and requiring `exp`/`iat`/`iss`/`aud` to be present
+
+`CONTEXT_VAULT_TOKEN` still works alongside it — either credential is accepted,
+so Claude Code can keep using the static token while claude.ai uses OAuth.
+
+#### Auth0 tenant setup
+
+1. **Settings → Advanced**: enable **Resource Parameter Compatibility Profile**.
+   Auth0 natively uses an `audience` parameter, while MCP clients send RFC 8707
+   `resource`; without this profile Auth0 ignores it and the audience is wrong.
+   Enable **Include Issuer in Authorization Responses** too.
+2. **Applications → APIs → Create API** with the identifier set to the connector
+   URL, e.g. `https://<host>/p/decision-tree/mcp`. Signing algorithm RS256.
+3. **Applications → Create Application**, type *Native* or *SPA* (a public
+   client, so PKCE and no secret). Add the callback URL
+   `https://claude.ai/api/mcp/auth_callback`. Copy the Client ID.
+4. In Claude's **Add custom connector** dialog, paste that Client ID into
+   **OAuth Client ID** and leave the secret empty.
+
+> **One API per project, or one for all?** Auth0's docs don't state whether the
+> `resource` URI is matched to an API identifier exactly or by prefix, and it
+> decides the answer. If the match is exact you need one Auth0 API per connector
+> URL — leave `CONTEXT_VAULT_OAUTH_AUDIENCE` unset and the per-project URL is
+> required as the audience. If one API can cover every project, set
+> `CONTEXT_VAULT_OAUTH_AUDIENCE` to that identifier instead. Set up the first
+> project and connect it; which case you're in becomes obvious immediately.
+
 ### Auth and claude.ai connectors
 
 Anthropic supports several [connector auth types](https://claude.com/docs/connectors/building/authentication).
