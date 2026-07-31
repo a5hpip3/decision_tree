@@ -227,8 +227,15 @@ class TestMetadataDocument:
     def test_shape(self, config):
         doc = oauth.protected_resource_metadata(PROJECT_URL, config)
         assert doc["resource"] == PROJECT_URL
-        assert doc["authorization_servers"] == ["https://tenant.us.auth0.com"]
+        assert doc["authorization_servers"] == ["https://tenant.us.auth0.com/"]
         assert doc["bearer_methods_supported"] == ["header"]
+
+    def test_authorization_server_matches_auth0_issuer_exactly(self, config):
+        """Trailing slash included — Auth0 reports `iss` with one, and a client
+        comparing this entry against the issuer must see them match."""
+        doc = oauth.protected_resource_metadata(PROJECT_URL, config)
+        assert doc["authorization_servers"] == [config.issuer_url]
+        assert doc["authorization_servers"][0].endswith("/")
 
     def test_scopes_only_when_required(self, config):
         assert "scopes_supported" not in oauth.protected_resource_metadata(
@@ -281,7 +288,7 @@ class TestOverHttp:
         assert response.status_code == 200
         body = response.json()
         assert body["resource"].endswith("/p/decision-tree/mcp")
-        assert body["authorization_servers"] == ["https://tenant.us.auth0.com"]
+        assert body["authorization_servers"] == ["https://tenant.us.auth0.com/"]
 
     def test_unauthenticated_call_challenges_with_metadata_pointer(self, vault, keypair):
         async def scenario():

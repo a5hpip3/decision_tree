@@ -117,7 +117,10 @@ def protected_resource_metadata(resource_url: str, config: OAuthConfig) -> dict:
     """
     metadata = {
         "resource": resource_url,
-        "authorization_servers": [config.issuer_url.rstrip("/")],
+        # The issuer identifier verbatim, trailing slash included. Auth0's own
+        # metadata reports `iss` as "https://tenant.us.auth0.com/", and a client
+        # that compares this entry against that value must see them match.
+        "authorization_servers": [config.issuer_url],
         "bearer_methods_supported": ["header"],
         "resource_name": "Context Vault",
     }
