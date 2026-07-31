@@ -6,8 +6,13 @@ never deleted, only superseded — the append-only log is the version history.
 
 Storage: one SQLite file per project under ~/.context-vault/projects/, so a
 vault only ever surfaces the decisions made in the project it belongs to.
+
+Run over stdio (the default) and the project is the local git root. Run over
+HTTP via http_app.py and there is no filesystem to read, so the project comes
+from the request URL instead — see REMOTE_PROJECT below.
 """
 
+import contextvars
 import hashlib
 import os
 import re
@@ -50,8 +55,20 @@ CREATE TABLE IF NOT EXISTS meta (
 );
 """
 
-VAULT_HOME = Path.home() / ".context-vault"
+VAULT_HOME = Path(
+    os.environ.get("CONTEXT_VAULT_HOME") or Path.home() / ".context-vault"
+).expanduser()
 LEGACY_DB = VAULT_HOME / "vault.db"
+
+# Set per-request by http_app when serving over HTTP, where there is no project
+# filesystem to inspect. Unset under stdio, which resolves the project locally.
+REMOTE_PROJECT: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "remote_project", default=None
+)
+
+# A remote project name becomes a filename, so it is validated rather than
+# sanitised — anything not matching this is rejected at the edge, never coerced.
+PROJECT_NAME = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
 
 
 def project_root() -> Path:
@@ -84,10 +101,28 @@ def project_slug(root: Path) -> str:
 
 
 def db_path() -> Path:
+    # A remote project outranks CONTEXT_VAULT_DB deliberately: that env var
+    # pins one file, which in a multi-tenant HTTP process would silently
+    # collapse every project into a shared vault.
+    remote = REMOTE_PROJECT.get()
+    if remote is not None:
+        return VAULT_HOME / "remote" / f"{remote}.db"
     override = os.environ.get("CONTEXT_VAULT_DB")
     if override:
         return Path(override).expanduser()
     return VAULT_HOME / "projects" / f"{project_slug(project_root())}.db"
+
+
+def project_identity() -> str:
+    """Stable identifier recorded in each vault's meta table."""
+    remote = REMOTE_PROJECT.get()
+    return f"remote:{remote}" if remote is not None else str(project_root())
+
+
+def project_label() -> str:
+    """Human-readable project name for briefs and empty-vault messages."""
+    remote = REMOTE_PROJECT.get()
+    return remote if remote is not None else project_root().name
 
 
 def connect() -> sqlite3.Connection:
@@ -102,13 +137,16 @@ def connect() -> sqlite3.Connection:
         # happens to be read from later.
         conn.execute(
             "INSERT OR IGNORE INTO meta (key, value) VALUES ('project_path', ?)",
-            (str(project_root()),),
+            (project_identity(),),
         )
     return conn
 
 
 def empty_vault_note() -> str:
     """Hint shown on an empty vault when a pre-per-project vault exists."""
+    # Meaningless to a remote client: it can't read the server's filesystem.
+    if REMOTE_PROJECT.get() is not None:
+        return ""
     if os.environ.get("CONTEXT_VAULT_DB") or not LEGACY_DB.exists():
         return ""
     return (
@@ -210,7 +248,7 @@ def list_decisions(include_superseded: bool = False) -> str:
     with closing(connect()) as conn:
         rows = conn.execute(query).fetchall()
     if not rows:
-        return f"No decisions logged yet for {project_root().name}.{empty_vault_note()}"
+        return f"No decisions logged yet for {project_label()}.{empty_vault_note()}"
     return "\n".join(format_decision(r) for r in rows)
 
 
@@ -236,7 +274,7 @@ def get_project_brief() -> str:
     project. Superseded decisions are excluded; use list_decisions with
     include_superseded=true to see how the project got here.
     """
-    root = project_root()
+    label = project_label()
     with closing(connect()) as conn:
         rows = conn.execute(
             "SELECT * FROM decisions WHERE superseded_by IS NULL ORDER BY id"
@@ -246,10 +284,10 @@ def get_project_brief() -> str:
         ).fetchone()[0]
     if not rows:
         return (
-            f"No decisions logged yet — {root.name} has no recorded history."
+            f"No decisions logged yet — {label} has no recorded history."
             f"{empty_vault_note()}"
         )
-    parts = [f"# Project brief — {root.name}\n", "Active decisions:\n"]
+    parts = [f"# Project brief — {label}\n", "Active decisions:\n"]
     for row in rows:
         parts.append(f"- #{row['id']} ({row['created_at']}): {row['summary']}")
         parts.append(f"  Why: {row['reasoning']}")

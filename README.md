@@ -38,6 +38,94 @@ Or add to `.mcp.json` in your project root:
 
 ### Cursor (`~/.cursor/mcp.json`) — same JSON shape as above.
 
+MCP hosts don't inherit your shell, so point `command` at an interpreter that
+actually has the SDK installed (a venv's `bin/python`), not bare `python`.
+
+### Claude Desktop
+
+Desktop runs local stdio servers too, but it doesn't launch them from a project
+directory — so `project_root()` would fall back to whatever cwd the app uses and
+every conversation would share one catch-all vault. Pin the project explicitly,
+one entry per project you want to track:
+
+```json
+{
+  "mcpServers": {
+    "context-vault-myproject": {
+      "command": "/path/to/.venv/bin/python",
+      "args": ["/path/to/context-vault/server.py"],
+      "env": { "CONTEXT_VAULT_PROJECT": "/path/to/myproject" }
+    }
+  }
+}
+```
+
+## HTTP transport — one connector URL per project
+
+`server.py` speaks stdio, where the project is the local git root. For chat
+interfaces there is no project filesystem, so `http_app.py` serves the same five
+tools over streamable HTTP and takes the project from the URL:
+
+```
+https://<host>/p/<project>/mcp
+```
+
+The tool signatures are unchanged — an agent can't misname the project, because
+it never names it. You add a connector per project instead.
+
+```bash
+pip install -r requirements.txt
+CONTEXT_VAULT_TOKEN=$(openssl rand -hex 32) python http_app.py   # :8000
+```
+
+| Env var | Purpose |
+|---|---|
+| `CONTEXT_VAULT_HOME` | Where vaults live (set to the mounted volume in production) |
+| `CONTEXT_VAULT_TOKEN` | Bearer token required on `/p/...`; unset means **no auth** |
+| `PORT` / `HOST` | Listen address (default `0.0.0.0:8000`) |
+
+Project names are validated against `^[a-z0-9][a-z0-9._-]{0,63}$` and rejected
+with a 404 if they don't match — never coerced, since the name becomes a
+filename. `/healthz` and `/` stay open for platform health checks.
+
+Served **stateless**: every tool call is an independent SQLite transaction, so
+there's no session state worth keeping, and it avoids session affinity if this
+ever runs on more than one replica.
+
+### Deploying
+
+```bash
+railway init
+railway volume add --mount-path /data     # required — without it, redeploys wipe history
+railway variables --set "CONTEXT_VAULT_TOKEN=$(openssl rand -hex 32)"
+railway up
+```
+
+The `Dockerfile` sets `CONTEXT_VAULT_HOME=/data`, so the volume mount path is
+what makes vaults survive a redeploy.
+
+### Auth and claude.ai connectors
+
+Anthropic supports several [connector auth types](https://claude.com/docs/connectors/building/authentication).
+This server targets two of them, and OAuth is **not** required:
+
+| Mode | How | Status |
+|---|---|---|
+| `none` | leave `CONTEXT_VAULT_TOKEN` unset | supported; anyone with the URL can read and write the vault |
+| `static_headers` | set `CONTEXT_VAULT_TOKEN`, admin enters `Authorization: Bearer <token>` when adding the connector | beta |
+
+OAuth (`oauth_dcr` / `oauth_cimd`) is not implemented. It would be the right
+move for a multi-user deployment, since `static_headers` shares one credential
+across the whole organization rather than identifying individual users.
+
+The `401` response deliberately omits `WWW-Authenticate`. Claude treats `401` +
+`WWW-Authenticate: Bearer` as an OAuth challenge and starts hunting for
+protected-resource metadata, so including it turns a simple bad-token error into
+a misleading "Couldn't reach the MCP server".
+
+Never put the token in the URL — Anthropic's docs and the MCP spec both
+prohibit credentials in query strings, and this server never reads one.
+
 ## The one instruction that makes it work
 
 Add this to your project's `CLAUDE.md` (or Cursor rules):
