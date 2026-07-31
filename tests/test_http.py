@@ -263,6 +263,62 @@ class TestOverHttp:
         assert index.json()["connect"] == "/p/<project>/mcp"
 
 
+class TestTransportSecurity:
+    """The SDK allows only 127.0.0.1 by default, so a hosted deployment answers
+    every request with 421 Invalid Host header until its domain is allowed.
+    """
+
+    def test_unset_keeps_sdk_default(self):
+        assert http_app.transport_security(None) is None
+        assert http_app.transport_security("") is None
+
+    def test_star_disables_the_check(self):
+        settings = http_app.transport_security("*")
+        assert settings.enable_dns_rebinding_protection is False
+
+    def test_named_hosts_are_allowed_with_and_without_port(self):
+        settings = http_app.transport_security("vault.example.com")
+        assert settings.enable_dns_rebinding_protection is True
+        assert "vault.example.com" in settings.allowed_hosts
+        assert "vault.example.com:*" in settings.allowed_hosts
+        assert "https://vault.example.com" in settings.allowed_origins
+
+    def test_multiple_hosts(self):
+        settings = http_app.transport_security("a.example.com, b.example.com")
+        assert "a.example.com" in settings.allowed_hosts
+        assert "b.example.com" in settings.allowed_hosts
+
+    def test_foreign_host_is_rejected_end_to_end(self, vault):
+        """A Host header outside the allowlist must not reach the tools."""
+
+        async def scenario():
+            import httpx2
+
+            app = http_app.build_app(allowed_hosts="vault.example.com")
+            async with Server(app) as srv:
+                async with httpx2.AsyncClient() as client:
+                    return await client.post(
+                        srv.url("alpha"),
+                        headers={
+                            "Host": "evil.example.com",
+                            "Content-Type": "application/json",
+                            "Accept": "application/json, text/event-stream",
+                        },
+                        json={
+                            "jsonrpc": "2.0",
+                            "id": 1,
+                            "method": "initialize",
+                            "params": {
+                                "protocolVersion": "2025-06-18",
+                                "capabilities": {},
+                                "clientInfo": {"name": "t", "version": "1"},
+                            },
+                        },
+                    )
+
+        assert run(scenario()).status_code == 421
+
+
 class TestAuth:
     def test_missing_token_is_rejected(self, vault):
         async def scenario():

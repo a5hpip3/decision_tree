@@ -20,6 +20,7 @@ from __future__ import annotations
 import os
 import secrets
 
+from mcp.server.transport_security import TransportSecuritySettings
 from starlette.applications import Starlette
 from starlette.responses import JSONResponse, PlainTextResponse
 from starlette.routing import Route
@@ -73,13 +74,40 @@ async def index(_request):
     )
 
 
-def build_app(token: str | None = None):
+def transport_security(allowed_hosts: str | None) -> TransportSecuritySettings | None:
+    """DNS-rebinding protection tuned for wherever this is deployed.
+
+    The SDK defaults to allowing only 127.0.0.1, so a hosted deployment answers
+    every request with `421 Invalid Host header` until its own domain is
+    allowed. Set CONTEXT_VAULT_ALLOWED_HOSTS to a comma-separated list of the
+    hostnames it is served on, or to `*` to disable the check when a trusted
+    proxy already terminates and validates the hostname.
+    """
+    if not allowed_hosts:
+        return None
+    hosts = [h.strip() for h in allowed_hosts.split(",") if h.strip()]
+    if "*" in hosts:
+        return TransportSecuritySettings(enable_dns_rebinding_protection=False)
+    # Ports are part of the Host header, so allow both forms.
+    expanded = [h for host in hosts for h in (host, f"{host}:*")]
+    return TransportSecuritySettings(
+        enable_dns_rebinding_protection=True,
+        allowed_hosts=expanded,
+        allowed_origins=[f"https://{h}" for h in hosts] + [f"http://{h}" for h in hosts],
+    )
+
+
+def build_app(token: str | None = None, allowed_hosts: str | None = None):
     """ASGI app routing /p/<project>/mcp to the MCP server.
 
     token: if set, every /p/... request must present it as a bearer token.
     Health and index stay open so platform health checks work unauthenticated.
+    allowed_hosts: see transport_security().
     """
-    mcp_app = server.mcp.streamable_http_app(stateless_http=True)
+    mcp_app = server.mcp.streamable_http_app(
+        stateless_http=True,
+        transport_security=transport_security(allowed_hosts),
+    )
 
     routes = [Route("/", index), Route("/healthz", health)]
     shell = Starlette(routes=routes)
@@ -127,7 +155,10 @@ def _authorized(scope, token: str) -> bool:
     return False
 
 
-app = build_app(token=os.environ.get("CONTEXT_VAULT_TOKEN") or None)
+app = build_app(
+    token=os.environ.get("CONTEXT_VAULT_TOKEN") or None,
+    allowed_hosts=os.environ.get("CONTEXT_VAULT_ALLOWED_HOSTS") or None,
+)
 
 
 if __name__ == "__main__":

@@ -82,7 +82,13 @@ CONTEXT_VAULT_TOKEN=$(openssl rand -hex 32) python http_app.py   # :8000
 |---|---|
 | `CONTEXT_VAULT_HOME` | Where vaults live (set to the mounted volume in production) |
 | `CONTEXT_VAULT_TOKEN` | Bearer token required on `/p/...`; unset means **no auth** |
+| `CONTEXT_VAULT_ALLOWED_HOSTS` | Hostnames this is served on, comma-separated; `*` disables the check |
 | `PORT` / `HOST` | Listen address (default `0.0.0.0:8000`) |
+
+**`CONTEXT_VAULT_ALLOWED_HOSTS` is required for any hosted deployment.** The MCP
+SDK's DNS-rebinding protection allows only `127.0.0.1` by default, so without it
+every request returns `421 Invalid Host header` — including the initialize
+handshake, which makes the server look broken rather than misconfigured.
 
 Project names are validated against `^[a-z0-9][a-z0-9._-]{0,63}$` and rejected
 with a 404 if they don't match — never coerced, since the name becomes a
@@ -95,14 +101,25 @@ ever runs on more than one replica.
 ### Deploying
 
 ```bash
-railway init
+railway init --name context-vault
+railway add --service context-vault \
+  --variables "CONTEXT_VAULT_TOKEN=$(openssl rand -hex 32)" \
+  --variables "CONTEXT_VAULT_HOME=/data"
+railway service link context-vault
 railway volume add --mount-path /data     # required — without it, redeploys wipe history
-railway variables --set "CONTEXT_VAULT_TOKEN=$(openssl rand -hex 32)"
-railway up
+railway up --ci
+railway domain --port 8000                # then feed the domain back in:
+railway variables --set "CONTEXT_VAULT_ALLOWED_HOSTS=<your-domain>"
+railway up --ci
 ```
 
 The `Dockerfile` sets `CONTEXT_VAULT_HOME=/data`, so the volume mount path is
-what makes vaults survive a redeploy.
+what makes vaults survive a redeploy. It deliberately has no `VOLUME`
+instruction — Railway rejects the build with "use Railway Volumes" and manages
+the mount itself.
+
+The domain is needed *before* the server will answer, but only exists *after*
+the first deploy, so the sequence above deploys twice on purpose.
 
 ### Auth and claude.ai connectors
 

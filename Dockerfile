@@ -8,8 +8,9 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY server.py http_app.py ./
 
 # Vaults live on a mounted volume — without one, every redeploy wipes history.
+# No VOLUME instruction: Railway rejects it ("use Railway Volumes") and manages
+# the mount itself, so attach the volume at /data on the service instead.
 ENV CONTEXT_VAULT_HOME=/data
-VOLUME ["/data"]
 
 # http_app reads PORT itself, so no shell expansion is needed in the command.
 ENV PORT=8000
