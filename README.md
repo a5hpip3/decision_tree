@@ -212,6 +212,44 @@ so far is a client pointed at the wrong project — decisions land in a vault th
 looks fine until you read it. Naming it up front is cheaper than moving and
 retiring them afterwards.
 
+### Connecting a repo to the hosted vault
+
+Install the stdio server once at user scope and it is live in every repo, which
+means it can configure the hosted connection for you — no URL or token to copy:
+
+```bash
+claude mcp add -s user context-vault \
+  -e CONTEXT_VAULT_HOSTED_URL=https://<your-host> \
+  -- /path/to/.venv/bin/python /path/to/server.py
+```
+
+Then, in any repo you want on the shared history, ask for `connect_hosted`. It
+writes `.mcp.json` at the repo root:
+
+```json
+{
+  "mcpServers": {
+    "context-vault": {
+      "type": "http",
+      "url": "https://<your-host>/p/<project>/mcp",
+      "headers": { "Authorization": "Bearer ${CONTEXT_VAULT_TOKEN}" }
+    }
+  }
+}
+```
+
+The token is a `${VAR}` reference, not a literal — Claude Code expands it at
+load time, so **the file is safe to commit** and teammates get the server when
+they open the repo. Export `CONTEXT_VAULT_TOKEN` once in your shell profile.
+
+Existing servers and unrelated keys in an existing `.mcp.json` are preserved,
+re-running is idempotent, and a malformed file is left untouched rather than
+overwritten. Project-scoped servers sit at `⏸ Pending approval` until you run
+`claude` in the repo and accept it — a repo cannot approve its own servers.
+
+Connecting to hosted does not move or delete the repo's local vault; that
+history stays where it is.
+
 ### Naming a project
 
 `name_project` writes `.context-vault` at the repo root:
@@ -252,6 +290,7 @@ Add this to your project's `CLAUDE.md` (or Cursor rules):
 | `get_project_brief` | The "catch me up" view — all active decisions |
 | `setup` | Where am I connected, and what's left to configure |
 | `name_project` | Pin this repo's canonical name (writes `.context-vault`) |
+| `connect_hosted` | Point this repo at the hosted vault (writes `.mcp.json`) |
 
 All six operate on the current project's vault only — see [Storage](#storage).
 

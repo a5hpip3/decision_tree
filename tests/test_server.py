@@ -456,6 +456,7 @@ def test_all_tools_are_registered():
         "get_project_brief",
         "setup",
         "name_project",
+        "connect_hosted",
     }
 
 

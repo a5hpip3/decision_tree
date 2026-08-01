@@ -31,8 +31,66 @@ debugging steps. At the start of a session, call `get_project_brief` to load \
 context."""
 
 
+MCP_CONFIG_FILE = ".mcp.json"
+HOSTED_URL_ENV = "CONTEXT_VAULT_HOSTED_URL"
+TOKEN_ENV = "CONTEXT_VAULT_TOKEN"
+
+
 def declaration_path(root: Path) -> Path:
     return root / DECLARATION_FILE
+
+
+def normalise_host(raw: str) -> str:
+    """Accept a bare hostname or a full URL, with or without an /p/... path."""
+    host = raw.strip().rstrip("/")
+    if not host:
+        return ""
+    if "://" not in host:
+        host = f"https://{host}"
+    # Tolerate someone pasting a whole connector URL.
+    return re.sub(r"/p/[^/]+/mcp$", "", host).rstrip("/")
+
+
+def hosted_entry(base: str, project: str) -> dict:
+    """The .mcp.json entry for this project's hosted vault.
+
+    The token is written as a ${VAR} reference, never inlined — .mcp.json is
+    meant to be committed, and Claude Code expands the variable at load time.
+    """
+    return {
+        "type": "http",
+        "url": f"{base}/p/{project}/mcp",
+        "headers": {"Authorization": f"Bearer ${{{TOKEN_ENV}}}"},
+    }
+
+
+def merge_mcp_config(root: Path, entry: dict, name: str = "context-vault") -> tuple[Path, str]:
+    """Add or update one server in the repo's .mcp.json, preserving the rest.
+
+    Returns (path, action) where action is created, updated or unchanged. Other
+    servers in the file are never touched — a repo may already depend on them.
+    """
+    path = root / MCP_CONFIG_FILE
+    config: dict = {}
+    if path.exists():
+        try:
+            config = json.loads(path.read_text() or "{}")
+        except ValueError as exc:
+            raise ValueError(f"{path} is not valid JSON ({exc}); leaving it alone") from exc
+        if not isinstance(config, dict):
+            raise ValueError(f"{path} does not contain a JSON object; leaving it alone")
+
+    servers = config.setdefault("mcpServers", {})
+    if not isinstance(servers, dict):
+        raise ValueError(f"{path} has a non-object mcpServers key; leaving it alone")
+
+    previous = servers.get(name)
+    if previous == entry:
+        return path, "unchanged"
+
+    servers[name] = entry
+    path.write_text(json.dumps(config, indent=2) + "\n")
+    return path, ("updated" if previous is not None else "created")
 
 
 def read_declared_name(root: Path) -> str | None:
@@ -148,17 +206,14 @@ def report(state: dict) -> str:
         lines += [
             "Right now this is a **local** vault on this machine only.",
             "",
-            "To share one history with the Claude apps instead, point this repo "
-            "at the hosted server (run inside the repo):",
+            "To share one history with the Claude apps instead, call "
+            f"`connect_hosted`. It writes `{MCP_CONFIG_FILE}` for this repo "
+            f"pointing at `/p/{name}/mcp`, with the token as a "
+            f"`${{{TOKEN_ENV}}}` reference rather than inlined, so the file is "
+            "safe to commit and teammates get the server on opening the repo.",
             "",
-            "```bash",
-            "claude mcp add -s local context-vault --transport http \\",
-            f"  https://<your-host>/p/{name}/mcp \\",
-            '  -H "Authorization: Bearer <token>"',
-            "```",
-            "",
-            "Local scope overrides the global setting for this repo only; every "
-            "other repo keeps capturing locally.",
+            f"Only this repo is affected; every other one keeps capturing "
+            "locally.",
         ]
     lines.append("")
 

@@ -513,6 +513,60 @@ async def _ask_for_name(ctx, suggested: str) -> str:
         return ""
 
 
+@mcp.tool()
+def connect_hosted(host: str = "", project: str = "") -> str:
+    """Point this repo at the hosted vault by writing its .mcp.json.
+
+    Writes a project-scoped MCP config so this repo's decisions go to the
+    shared hosted server instead of a local vault — the same history the
+    Claude apps see. The token is written as a ${CONTEXT_VAULT_TOKEN}
+    reference rather than inlined, so the file is safe to commit.
+
+    Args:
+        host: The hosted server, e.g. https://vault.example.com. Defaults to
+            the CONTEXT_VAULT_HOSTED_URL environment variable.
+        project: Project name for the URL. Defaults to this repo's declared
+            name, else one derived from the directory name.
+    """
+    import onboarding
+
+    if REMOTE_PROJECT.get() is not None:
+        return (
+            "This client already talks to the hosted server — there is nothing "
+            "to connect. Run this from a client using the local stdio server."
+        )
+
+    base = onboarding.normalise_host(host or os.environ.get(onboarding.HOSTED_URL_ENV, ""))
+    if not base:
+        return (
+            "Error: no hosted server known. Pass host=\"https://your-host\", or "
+            f"set {onboarding.HOSTED_URL_ENV} in this MCP server's environment "
+            "so it works everywhere without arguments."
+        )
+
+    root = project_root()
+    name = project or onboarding.read_declared_name(root) or onboarding.suggest_name(root)
+    if not PROJECT_NAME.match(name):
+        return f"Error: {name!r} is not a valid project name ({PROJECT_NAME.pattern})."
+
+    try:
+        path, action = onboarding.merge_mcp_config(root, onboarding.hosted_entry(base, name))
+    except (OSError, ValueError) as exc:
+        return f"Error: {exc}"
+
+    if action == "unchanged":
+        return f"{path} already points at {base}/p/{name}/mcp — nothing to change."
+    return (
+        f"{action.capitalize()} {path}, pointing this repo at "
+        f"{base}/p/{name}/mcp.\n\n"
+        f"Next: export {onboarding.TOKEN_ENV} in your shell profile (the file "
+        "references it rather than storing it, so it is safe to commit), then "
+        "restart Claude Code in this repo and approve the project-scoped "
+        "server when prompted. Existing local history for this repo stays "
+        "where it is."
+    )
+
+
 @mcp.prompt(
     name="setup",
     title="Context Vault setup",
