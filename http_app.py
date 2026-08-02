@@ -107,7 +107,7 @@ async def health(_request):
 async def index(_request):
     return JSONResponse(
         {
-            "service": "context-vault",
+            "service": "decisiontree",
             "connect": "/p/<project>/mcp",
             "project_name": server.PROJECT_NAME.pattern,
         }

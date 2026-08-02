@@ -122,7 +122,7 @@ def protected_resource_metadata(resource_url: str, config: OAuthConfig) -> dict:
         # that compares this entry against that value must see them match.
         "authorization_servers": [config.issuer_url],
         "bearer_methods_supported": ["header"],
-        "resource_name": "Context Vault",
+        "resource_name": "DecisionTree",
     }
     if config.required_scopes:
         metadata["scopes_supported"] = list(config.required_scopes)

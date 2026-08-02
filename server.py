@@ -27,7 +27,7 @@ except ImportError:  # mcp 1.x
     from mcp.server.fastmcp import FastMCP as Server
 
 mcp = Server(
-    name="context-vault",
+    name="decisiontree",
     instructions=(
         "Log meaningful project decisions (architecture, stack, approach "
         "ruled out, direction change) with log_decision as they happen. "
@@ -569,7 +569,7 @@ def connect_hosted(host: str = "", project: str = "") -> str:
 
 @mcp.prompt(
     name="setup",
-    title="Context Vault setup",
+    title="DecisionTree setup",
     description="Show which project this is connected to and how to finish setup.",
 )
 def setup_prompt() -> str:

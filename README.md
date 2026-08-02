@@ -16,7 +16,7 @@ pip install mcp
 ### Claude Code
 
 ```bash
-claude mcp add -s user context-vault -- python /path/to/context-vault/server.py
+claude mcp add -s user decisiontree -- python /path/to/context-vault/server.py
 ```
 
 Installing once at user scope (`-s user`) is enough — the vault is scoped per
@@ -28,7 +28,7 @@ Or add to `.mcp.json` in your project root:
 ```json
 {
   "mcpServers": {
-    "context-vault": {
+    "decisiontree": {
       "command": "python",
       "args": ["/path/to/context-vault/server.py"]
     }
@@ -51,7 +51,7 @@ one entry per project you want to track:
 ```json
 {
   "mcpServers": {
-    "context-vault-myproject": {
+    "decisiontree-myproject": {
       "command": "/path/to/.venv/bin/python",
       "args": ["/path/to/context-vault/server.py"],
       "env": { "CONTEXT_VAULT_PROJECT": "/path/to/myproject" }
@@ -218,7 +218,7 @@ Install the stdio server once at user scope and it is live in every repo, which
 means it can configure the hosted connection for you — no URL or token to copy:
 
 ```bash
-claude mcp add -s user context-vault \
+claude mcp add -s user decisiontree \
   -e CONTEXT_VAULT_HOSTED_URL=https://<your-host> \
   -- /path/to/.venv/bin/python /path/to/server.py
 ```
@@ -229,7 +229,7 @@ writes `.mcp.json` at the repo root:
 ```json
 {
   "mcpServers": {
-    "context-vault": {
+    "decisiontree": {
       "type": "http",
       "url": "https://<your-host>/p/<project>/mcp",
       "headers": { "Authorization": "Bearer ${CONTEXT_VAULT_TOKEN}" }

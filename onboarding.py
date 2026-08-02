@@ -64,7 +64,7 @@ def hosted_entry(base: str, project: str) -> dict:
     }
 
 
-def merge_mcp_config(root: Path, entry: dict, name: str = "context-vault") -> tuple[Path, str]:
+def merge_mcp_config(root: Path, entry: dict, name: str = "decisiontree") -> tuple[Path, str]:
     """Add or update one server in the repo's .mcp.json, preserving the rest.
 
     Returns (path, action) where action is created, updated or unchanged. Other
@@ -153,7 +153,7 @@ def vault_state() -> dict:
 
 def report(state: dict) -> str:
     """The setup walkthrough, tailored to how this client is connected."""
-    lines = ["# Context Vault — setup", ""]
+    lines = ["# DecisionTree — setup", ""]
 
     transport = "hosted HTTP" if state["hosted"] else "local (stdio)"
     lines += [

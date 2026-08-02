@@ -464,3 +464,9 @@ def test_tool_descriptions_are_populated():
     """Docstrings are the prompt an agent reads — an empty one is a real bug."""
     for tool in asyncio.run(server.mcp.list_tools()):
         assert tool.description, f"{tool.name} has no description"
+
+
+def test_server_identity_is_stable():
+    """The name clients display. Renaming it changes what users look for in
+    /mcp and orphans existing client config entries, so it is pinned here."""
+    assert server.mcp.name == "decisiontree"

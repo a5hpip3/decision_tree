@@ -38,7 +38,7 @@ class TestConnectHosted:
         assert "Created" in result
 
         config = json.loads((root / ".mcp.json").read_text())
-        entry = config["mcpServers"]["context-vault"]
+        entry = config["mcpServers"]["decisiontree"]
         assert entry["type"] == "http"
         assert entry["url"] == f"{HOST}/p/my_repo/mcp"
         assert entry["headers"]["Authorization"] == "Bearer ${CONTEXT_VAULT_TOKEN}"
@@ -55,13 +55,13 @@ class TestConnectHosted:
         onboarding.write_declared_name(root, "pretty-name")
         connect_hosted(host=HOST)
         config = json.loads((root / ".mcp.json").read_text())
-        assert config["mcpServers"]["context-vault"]["url"].endswith("/p/pretty-name/mcp")
+        assert config["mcpServers"]["decisiontree"]["url"].endswith("/p/pretty-name/mcp")
 
     def test_explicit_project_wins(self, vault):
         root = vault.enter(vault.project("my_repo"))
         connect_hosted(host=HOST, project="chosen")
         config = json.loads((root / ".mcp.json").read_text())
-        assert config["mcpServers"]["context-vault"]["url"].endswith("/p/chosen/mcp")
+        assert config["mcpServers"]["decisiontree"]["url"].endswith("/p/chosen/mcp")
 
     def test_host_from_environment(self, vault, monkeypatch):
         root = vault.enter(vault.project())
@@ -84,7 +84,7 @@ class TestConnectHosted:
         )
         connect_hosted(host=HOST)
         servers = json.loads((root / ".mcp.json").read_text())["mcpServers"]
-        assert set(servers) == {"other", "context-vault"}
+        assert set(servers) == {"other", "decisiontree"}
         assert servers["other"]["url"] == "https://x/mcp"
 
     def test_preserves_unrelated_top_level_keys(self, vault):
@@ -106,7 +106,7 @@ class TestConnectHosted:
         result = connect_hosted(host="https://other.example.com")
         assert "Updated" in result
         config = json.loads((root / ".mcp.json").read_text())
-        assert "other.example.com" in config["mcpServers"]["context-vault"]["url"]
+        assert "other.example.com" in config["mcpServers"]["decisiontree"]["url"]
 
     def test_malformed_existing_file_is_left_alone(self, vault):
         root = vault.enter(vault.project())
