@@ -98,10 +98,13 @@ def summarise(name: str) -> dict:
         clusters: set[str] = set()
         last = None
         for row in conn.execute("SELECT * FROM decisions"):
-            counts[status_of(row)] += 1
+            status = status_of(row)
+            counts[status] += 1
             if row["cluster"]:
                 clusters.add(row["cluster"])
-            if last is None or row["created_at"] > last:
+            # A decision filed in error is not activity: counting it would make
+            # a project look freshly worked on because something was cleaned up.
+            if status != "retired" and (last is None or row["created_at"] > last):
                 last = row["created_at"]
     return {
         "name": name,

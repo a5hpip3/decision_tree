@@ -210,12 +210,21 @@ function layout(list) {
   return layoutCache.value;
 }
 
-function bbox(list, pos) {
+function bbox(list, pos, clusters = []) {
   let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
+  const cover = (x, y, w, h) => {
+    x0 = Math.min(x0, x); y0 = Math.min(y0, y);
+    x1 = Math.max(x1, x + w); y1 = Math.max(y1, y + h);
+  };
   list.forEach(d => {
     const p = nodePos(d.id, pos); if (!p) return;
-    x0 = Math.min(x0, p.x); y0 = Math.min(y0, p.y);
-    x1 = Math.max(x1, p.x + NW); y1 = Math.max(y1, p.y + NH);
+    cover(p.x, p.y, NW, NH);
+  });
+  // Cluster labels are drawn 120px wide, centred on the cluster's own node,
+  // and can sit outside every card — leave them out and they get clipped.
+  clusters.forEach(name => {
+    const p = pos['cl:' + name]; if (!p) return;
+    cover(p.x - 60, p.y - 10, 120, 20);
   });
   if (x0 === Infinity) return { x0: 0, y0: 0, x1: 1, y1: 1 };
   return { x0, y0, x1, y1 };

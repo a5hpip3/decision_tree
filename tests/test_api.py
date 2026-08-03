@@ -252,3 +252,28 @@ class TestApiAuth:
     def test_open_when_nothing_configured(self, vault):
         seed(vault, "proj", ["one"])
         assert self._get("/api/projects").status_code == 200
+
+
+class TestLastActivity:
+    def test_retired_decisions_do_not_count_as_activity(self, vault):
+        """A cleanup should not make a project look freshly worked on."""
+        # Real work dated in the past; the mistake logged just now, so it is
+        # the newest record. (A future created_at is rejected by design, so
+        # "newer" has to mean the server's own clock.)
+        in_project("proj", log_decision, "real work", "why", "x",
+                   created_at="2026-01-01T00:00:00+00:00")
+        in_project("proj", log_decision, "later mistake", "why", "x")
+
+        with_mistake = api.summarise("proj")["last_activity"]
+        assert not with_mistake.startswith("2026-01-01"), "mistake should be newest"
+
+        in_project("proj", retire_decision, 2, "filed in error")
+        after = api.summarise("proj")["last_activity"]
+
+        assert after == "2026-01-01T00:00:00+00:00", "should roll back to the real work"
+        assert api.summarise("proj")["retired"] == 1
+
+    def test_all_retired_means_no_last_activity(self, vault):
+        ids = seed(vault, "proj", ["only one"])
+        in_project("proj", retire_decision, ids[0], "misfiled")
+        assert api.summarise("proj")["last_activity"] is None
