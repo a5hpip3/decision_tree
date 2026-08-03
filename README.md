@@ -242,6 +242,14 @@ The token is a `${VAR}` reference, not a literal — Claude Code expands it at
 load time, so **the file is safe to commit** and teammates get the server when
 they open the repo. Export `CONTEXT_VAULT_TOKEN` once in your shell profile.
 
+**Export the token before connecting.** Claude Code expands `${VAR}` from its
+own environment; if the variable is unset it loads the config anyway and sends
+the literal text `Bearer ${CONTEXT_VAULT_TOKEN}`. The server detects that and
+says so by name rather than failing as an unparseable JWT. Note that a
+GUI-launched app does not read your shell profile — launch the client from a
+shell where the variable is set, or use `claude mcp add -s local` with the
+literal token instead (stored in `~/.claude.json`, never committed).
+
 Existing servers and unrelated keys in an existing `.mcp.json` are preserved,
 re-running is idempotent, and a malformed file is left untouched rather than
 overwritten. Project-scoped servers sit at `⏸ Pending approval` until you run

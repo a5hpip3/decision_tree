@@ -365,3 +365,36 @@ class TestAuth:
                 return await call(srv.url("alpha"), "get_project_brief")
 
         assert "no recorded history" in run(scenario())
+
+
+class TestUnexpandedCredential:
+    """A .mcp.json header written as ${VAR} arrives verbatim when the variable
+    is unset where the client runs. Left to the JWT verifier it fails with
+    "Not enough segments", which names neither the variable nor the cause."""
+
+    def test_recognises_a_placeholder(self):
+        assert http_app.unexpanded_variable("${CONTEXT_VAULT_TOKEN}") == "CONTEXT_VAULT_TOKEN"
+        assert http_app.unexpanded_variable("  ${MY_TOKEN}  ") == "MY_TOKEN"
+
+    def test_leaves_real_credentials_alone(self):
+        for value in ["309c8fa2e86b44", "eyJhbGciOiJSUzI1NiJ9.abc.def", "${}", "$NOT_BRACED", "a${X}b"]:
+            assert http_app.unexpanded_variable(value) is None
+
+    def test_the_error_names_the_variable_and_the_cause(self, vault):
+        async def scenario():
+            import httpx2
+
+            async with Server(http_app.build_app(token="secret")) as srv:
+                async with httpx2.AsyncClient() as client:
+                    return await client.post(
+                        srv.url("alpha"),
+                        json={},
+                        headers={"Authorization": "Bearer ${CONTEXT_VAULT_TOKEN}"},
+                    )
+
+        body = run(scenario())
+        assert body.status_code == 401
+        detail = body.json()["error_description"]
+        assert "CONTEXT_VAULT_TOKEN" in detail
+        assert "never substituted" in detail
+        assert "Not enough segments" not in detail

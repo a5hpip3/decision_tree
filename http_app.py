@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import secrets
 
 from mcp.server.transport_security import TransportSecuritySettings
@@ -33,6 +34,27 @@ import server
 API_PREFIX = "/api/"
 
 log = logging.getLogger("context-vault.auth")
+
+
+# A .mcp.json credential written as ${VAR} arrives verbatim when the variable
+# is unset where the client runs — Claude Code loads the config anyway and
+# sends the literal text.
+UNEXPANDED = re.compile(r"^\$\{([A-Za-z_][A-Za-z0-9_]*)\}$")
+
+
+def unexpanded_variable(credential: str) -> str | None:
+    """The variable name, if this credential is an unexpanded placeholder."""
+    match = UNEXPANDED.match(credential.strip())
+    return match.group(1) if match else None
+
+
+def placeholder_reason(name: str) -> str:
+    return (
+        f"the credential arrived as the literal text ${{{name}}}, so the "
+        f"{name} environment variable is not set where the client runs and was "
+        "never substituted. Set it in the shell that launches the client (a "
+        "GUI-launched app does not read your shell profile) and reconnect."
+    )
 
 
 def token_fingerprint(token: str) -> str:
@@ -189,6 +211,10 @@ def build_app(
             return "no bearer credential presented"
         if token is not None and secrets.compare_digest(presented, token):
             return None
+        placeholder = unexpanded_variable(presented)
+        if placeholder:
+            log.warning("auth: unexpanded %s for project=%s", placeholder, project)
+            return placeholder_reason(placeholder)
         if oauth_config is None:
             log.warning("auth: static token mismatch for project=%s", project)
             return "invalid token"
@@ -292,6 +318,9 @@ async def _api_authorized(scope, token, oauth_config, verifier) -> str | None:
         return "no bearer credential presented"
     if token is not None and secrets.compare_digest(presented, token):
         return None
+    placeholder = unexpanded_variable(presented)
+    if placeholder:
+        return placeholder_reason(placeholder)
     if oauth_config is None or not oauth_config.audience:
         return "invalid token"
     try:
