@@ -333,6 +333,28 @@ inherits the cluster of the decision it replaces.
 `cluster` and `source` appear in `list_decisions` output so an agent can see
 the labels already in use before inventing another.
 
+### How agents learn about these fields
+
+Nothing is required beyond `summary`, `reasoning` and `excerpt` — a required
+argument would break every existing caller, and it could only force a field to
+be *filled*, not filled well. The fields are encouraged in four places instead:
+
+1. **The tool description** — the full docstring, delivered on `tools/list`.
+2. **The server `instructions`**, sent in the initialize handshake.
+3. **`setup`**, as a tool and a prompt.
+4. **The response to `log_decision` itself**, which is the one that arrives
+   while the agent can still act:
+
+```
+Logged decision #13: Layer 6 caching…
+  No cluster set — labels already in use: Engine contracts, Landing page
+  No derives_from set — if this builds on one of these, say which: #12 …, #11 …
+```
+
+That hint only appears when it has something concrete to offer. The first
+decision in a project has no siblings to derive from and no labels to reuse, so
+it gets the plain confirmation. Retired decisions are never offered as parents.
+
 ## Read API
 
 A Railway volume mounts to exactly one service, so the web front-end cannot

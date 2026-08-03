@@ -229,6 +229,64 @@ def migrate(conn: sqlite3.Connection) -> None:
                 conn.execute(f"ALTER TABLE decisions ADD COLUMN {name} {decl}")
 
 
+def capture_hints(conn: sqlite3.Connection, new_id: int, cluster: str, parent) -> str:
+    """Nudge toward the fields that turn a list of decisions into a graph.
+
+    The agent reads its own tool result, so this is the one place feedback
+    arrives while it can still act on it — and it carries the project's actual
+    vocabulary rather than repeating generic advice from the docstring.
+
+    Only fires when it has something concrete to say: the first decision in a
+    project has no siblings to derive from and no labels to reuse, so it gets
+    the plain confirmation.
+    """
+    hints = []
+
+    if not cluster.strip():
+        labels = [
+            r["cluster"]
+            for r in conn.execute(
+                "SELECT DISTINCT cluster FROM decisions"
+                f" WHERE cluster IS NOT NULL AND id != ? AND {ACTIVE}"
+                " ORDER BY cluster",
+                (new_id,),
+            )
+        ]
+        if labels:
+            hints.append(
+                "No cluster set — labels already in use: " + ", ".join(labels[:6])
+            )
+        else:
+            total = conn.execute(
+                f"SELECT COUNT(*) FROM decisions WHERE {ACTIVE}"
+            ).fetchone()[0]
+            if total >= 3:
+                hints.append(
+                    "No cluster set — a short shared label groups related "
+                    "decisions and makes the history readable"
+                )
+
+    if parent is None:
+        recent = list(
+            conn.execute(
+                f"SELECT id, summary FROM decisions WHERE id != ? AND {ACTIVE}"
+                " ORDER BY id DESC LIMIT 3",
+                (new_id,),
+            )
+        )
+        if recent:
+            listed = ", ".join(
+                f"#{r['id']} {r['summary'][:48]}{'…' if len(r['summary']) > 48 else ''}"
+                for r in recent
+            )
+            hints.append(
+                "No derives_from set — if this builds on one of these, say which: "
+                + listed
+            )
+
+    return "".join(f"\n  {h}" for h in hints)
+
+
 def normalise_created_at(value: str) -> tuple[str | None, str | None]:
     """Resolve the timestamp for a new decision; returns (stamp, error).
 
@@ -390,7 +448,8 @@ def log_decision(
             (summary, reasoning, excerpt, stamp)
             + context_columns(parent, cluster, source, ref, author),
         )
-    return f"Logged decision #{cur.lastrowid}: {summary}"
+        hints = capture_hints(conn, cur.lastrowid, cluster, parent)
+    return f"Logged decision #{cur.lastrowid}: {summary}{hints}"
 
 
 @mcp.tool()

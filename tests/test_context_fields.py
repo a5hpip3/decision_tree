@@ -264,3 +264,71 @@ class TestCreatedAt:
                 for r in conn.execute("SELECT summary FROM decisions ORDER BY created_at")
             ]
         assert rows == ["Older", "Newer"]
+
+
+class TestCaptureHints:
+    """log_decision nudges toward the fields that make a graph — but only when
+    it has something concrete to offer."""
+
+    def test_first_decision_gets_no_hint(self, vault):
+        """Nothing to derive from and no labels to reuse: stay quiet."""
+        vault.enter(vault.project())
+        assert log_decision("First", "why", "x") == "Logged decision #1: First"
+
+    def test_suggests_labels_already_in_use(self, vault):
+        vault.enter(vault.project())
+        log("Has one", cluster="Engine contracts")
+        log("Has another", cluster="Landing page")
+        result = log_decision("Missing a cluster", "why", "x")
+        assert "No cluster set" in result
+        assert "Engine contracts" in result
+        assert "Landing page" in result
+
+    def test_no_cluster_hint_when_one_is_given(self, vault):
+        vault.enter(vault.project())
+        log("Has one", cluster="Engine")
+        result = log_decision("Also has one", "why", "x", cluster="Engine")
+        assert "No cluster set" not in result
+
+    def test_generic_cluster_hint_once_a_project_has_a_few(self, vault):
+        """No labels exist anywhere yet — the case that needs starting."""
+        vault.enter(vault.project())
+        for i in range(3):
+            log(f"Decision {i}")
+        result = log_decision("Fourth", "why", "x")
+        assert "No cluster set" in result
+        assert "groups related" in result
+
+    def test_suggests_recent_decisions_to_derive_from(self, vault):
+        vault.enter(vault.project())
+        first = log("Earlier decision")
+        result = log_decision("Follow-up", "why", "x")
+        assert "No derives_from set" in result
+        assert f"#{first} Earlier decision" in result
+
+    def test_no_derives_hint_when_a_parent_is_given(self, vault):
+        vault.enter(vault.project())
+        first = log("Earlier decision")
+        result = log_decision("Follow-up", "why", "x", derives_from=first)
+        assert "No derives_from set" not in result
+
+    def test_hints_list_at_most_three_recent(self, vault):
+        vault.enter(vault.project())
+        for i in range(6):
+            log(f"Decision {i}", cluster="Engine")
+        result = log_decision("Latest", "why", "x", cluster="Engine")
+        assert result.count("#") - 1 <= 3, result
+
+    def test_hint_does_not_offer_the_decision_itself(self, vault):
+        vault.enter(vault.project())
+        log("Earlier")
+        result = log_decision("This one", "why", "x")
+        new_id = int(result.split("#")[1].split(":")[0])
+        assert f"#{new_id} This one" not in result
+
+    def test_retired_decisions_are_not_offered_as_parents(self, vault):
+        vault.enter(vault.project())
+        first = log("Misfiled decision")
+        unwrap(server.retire_decision)(first, "wrong project")
+        result = log_decision("Next", "why", "x")
+        assert "Misfiled decision" not in result
