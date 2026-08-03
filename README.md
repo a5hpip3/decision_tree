@@ -403,6 +403,31 @@ session holds identity only and is tested to contain no credential.
 Auth0 needs the callback URL `https://<web-host>/auth/callback` registered on
 that application.
 
+### The Context Graph
+
+`web/static/` is the ported design: a left rail (projects, search, status /
+surface / cluster filters) and a force-directed canvas with pan, zoom and a
+414px detail panel.
+
+`layout()` in `app.js` is ported from the design's `graph()` and is faithful on
+purpose — the same virtual `__root` → cluster → decision hierarchy, the same
+spring weights and ideal lengths, the same 460 cooling iterations. Those
+constants are what make it look like the design rather than a generic force
+graph.
+
+Two adaptations the real data forced:
+
+- **Cards are a fixed 214×96**, the size the layout reserves. The design's
+  titles are one-liners; real summaries are paragraphs, and an auto-height card
+  overlaps its neighbours. Titles clamp to three lines and the full text lives
+  in the panel.
+- **Reasoning and excerpts wrap with `overflow-wrap:anywhere`**, because they
+  carry file paths, identifiers and stack traces with nothing to break on.
+
+Fields the vault does not carry yet are hidden rather than faked: with no
+clusters or sources, those rail sections simply do not render. A filter over a
+column that is always null is worse than no filter.
+
 ### Deploying the web service
 
 ```bash
