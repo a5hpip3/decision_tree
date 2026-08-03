@@ -276,7 +276,16 @@ Add this to your project's `CLAUDE.md` (or Cursor rules):
 > call `log_decision` with the summary, the reasoning, and a verbatim excerpt
 > of the conversation where it happened. If it reverses an earlier decision,
 > use `supersede_decision` instead. Do not log routine actions or debugging
-> steps. At the start of a session, call `get_project_brief` to load context.
+> steps.
+>
+> Connect it up: when the decision builds on an earlier one, pass
+> `derives_from` with that decision's id. Give it a short `cluster` label —
+> reuse the labels already in the project rather than inventing new ones — and
+> set `source` to chat, code, pr or doc, plus `ref` for the PR, file:line or
+> ticket it came from. A decision with no parent and no cluster is an isolated
+> dot; the history is only useful as a connected tree.
+>
+> At the start of a session, call `get_project_brief` to load context.
 
 ## Tools
 
@@ -300,6 +309,29 @@ all, typically because a client was pointed at the wrong project URL. Retiring
 drops it from the brief and the default timeline while keeping the full record,
 with a reason attached, under `include_superseded=true`. Neither deletes
 anything; the log remains append-only.
+
+## Decision context
+
+Beyond the summary, reasoning and excerpt, each decision carries optional
+context. All of it is optional — capture predates these fields and a required
+argument would break every agent already logging.
+
+| Field | Purpose |
+|---|---|
+| `derives_from` | Id of the decision this builds on. **This is what makes the history a tree** rather than a flat list |
+| `cluster` | Short theme reused across the project ("Landing page", "Engine contracts") |
+| `source` | Where it was decided: `chat`, `code`, `pr`, `doc` — a closed set, so it stays a usable filter |
+| `ref` | The artifact: PR number, `file:line`, ticket id, document section |
+| `author` | Who made the call, when known |
+
+`derives_from` is validated against the current project and rejected if it
+points at nothing — an edge to a missing decision is worse than no edge.
+`source` is rejected unless it is one of the four, because a mistyped surface
+would silently vanish from the filter rather than fail. `supersede_decision`
+inherits the cluster of the decision it replaces.
+
+`cluster` and `source` appear in `list_decisions` output so an agent can see
+the labels already in use before inventing another.
 
 ## Tests
 

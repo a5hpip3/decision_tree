@@ -27,8 +27,16 @@ decision — architecture, stack, library choice, approach ruled out, direction 
 change — call `log_decision` with the summary, the reasoning, and a verbatim \
 excerpt of the conversation where it happened. If it reverses an earlier \
 decision, use `supersede_decision` instead. Do not log routine actions or \
-debugging steps. At the start of a session, call `get_project_brief` to load \
-context."""
+debugging steps.
+
+Connect it up: when the decision builds on an earlier one, pass `derives_from` \
+with that decision's id. Give it a short `cluster` label — reuse the labels \
+already in the project rather than inventing new ones — and set `source` to \
+chat, code, pr or doc, plus `ref` for the PR, file:line or ticket it came \
+from. A decision with no parent and no cluster is an isolated dot; the history \
+is only useful as a connected tree.
+
+At the start of a session, call `get_project_brief` to load context."""
 
 
 MCP_CONFIG_FILE = ".mcp.json"

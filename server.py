@@ -31,6 +31,9 @@ mcp = Server(
     instructions=(
         "Log meaningful project decisions (architecture, stack, approach "
         "ruled out, direction change) with log_decision as they happen. "
+        "Set derives_from when a decision builds on an earlier one, and give "
+        "it a cluster label reused across the project — an unconnected, "
+        "unlabelled decision is far less useful later. "
         "Use supersede_decision when a decision reverses an earlier one. "
         "Call get_project_brief at the start of a session to load context. "
         "The vault is scoped to the current project — it holds only this "
@@ -48,7 +51,12 @@ CREATE TABLE IF NOT EXISTS decisions (
     supersedes     INTEGER REFERENCES decisions(id),
     superseded_by  INTEGER REFERENCES decisions(id),
     retired_at     TEXT,
-    retired_reason TEXT
+    retired_reason TEXT,
+    derives_from   INTEGER REFERENCES decisions(id),
+    cluster        TEXT,
+    source         TEXT,
+    ref            TEXT,
+    author         TEXT
 );
 
 CREATE TABLE IF NOT EXISTS meta (
@@ -59,7 +67,23 @@ CREATE TABLE IF NOT EXISTS meta (
 
 # Columns added after the first release. CREATE TABLE IF NOT EXISTS silently
 # leaves an existing table alone, so they have to be added explicitly.
-ADDED_COLUMNS = (("retired_at", "TEXT"), ("retired_reason", "TEXT"))
+ADDED_COLUMNS = (
+    ("retired_at", "TEXT"),
+    ("retired_reason", "TEXT"),
+    ("derives_from", "INTEGER"),
+    ("cluster", "TEXT"),
+    ("source", "TEXT"),
+    ("ref", "TEXT"),
+    ("author", "TEXT"),
+)
+
+# Where the decision was made. Kept small on purpose: a free-text field would
+# fragment into synonyms and stop being a usable filter.
+SOURCES = ("chat", "code", "pr", "doc")
+
+MAX_CLUSTER = 60
+MAX_REF = 200
+MAX_AUTHOR = 80
 
 # A decision is shown by default only while it is neither replaced nor retired.
 ACTIVE = "superseded_by IS NULL AND retired_at IS NULL"
@@ -205,6 +229,55 @@ def migrate(conn: sqlite3.Connection) -> None:
                 conn.execute(f"ALTER TABLE decisions ADD COLUMN {name} {decl}")
 
 
+def check_context(
+    conn: sqlite3.Connection,
+    derives_from: int | None,
+    cluster: str,
+    source: str,
+    ref: str,
+    author: str,
+) -> str | None:
+    """Validate the optional context fields; return an error string or None.
+
+    Every one of these is optional. Rejecting a bad value is better than
+    storing it: a mistyped source silently disappears from the surface filter,
+    and a derives_from pointing at nothing draws an edge to nowhere.
+    """
+    if derives_from is not None:
+        row = conn.execute(
+            "SELECT id FROM decisions WHERE id = ?", (derives_from,)
+        ).fetchone()
+        if row is None:
+            return (
+                f"Error: no decision #{derives_from} in this project to derive "
+                "from. Use list_decisions to find the right id, or omit "
+                "derives_from."
+            )
+    if source and source not in SOURCES:
+        return f"Error: source must be one of {', '.join(SOURCES)} (got {source!r})."
+    for value, limit, name in (
+        (cluster, MAX_CLUSTER, "cluster"),
+        (ref, MAX_REF, "ref"),
+        (author, MAX_AUTHOR, "author"),
+    ):
+        if len(value) > limit:
+            return f"Error: {name} is longer than {limit} characters."
+    return None
+
+
+def context_columns(
+    derives_from: int | None, cluster: str, source: str, ref: str, author: str
+) -> tuple:
+    """Values for the context columns, with blank strings stored as NULL."""
+    return (
+        derives_from,
+        cluster.strip() or None,
+        source.strip() or None,
+        ref.strip() or None,
+        author.strip() or None,
+    )
+
+
 def format_decision(row: sqlite3.Row, full: bool = False) -> str:
     if row["retired_at"]:
         status = "RETIRED"
@@ -212,20 +285,42 @@ def format_decision(row: sqlite3.Row, full: bool = False) -> str:
         status = f"SUPERSEDED by #{row['superseded_by']}"
     else:
         status = "active"
-    lines = [f"#{row['id']} [{status}] {row['created_at']}"]
+    tags = " ".join(
+        part
+        for part in (
+            f"[{row['cluster']}]" if row["cluster"] else "",
+            f"({row['source']})" if row["source"] else "",
+        )
+        if part
+    )
+    lines = [f"#{row['id']} [{status}] {row['created_at']}{' ' + tags if tags else ''}"]
     lines.append(f"  Decision: {row['summary']}")
     if row["retired_at"]:
         lines.append(f"  Retired {row['retired_at']}: {row['retired_reason']}")
     if full:
         lines.append(f"  Reasoning: {row['reasoning']}")
+        if row["derives_from"]:
+            lines.append(f"  Derives from: #{row['derives_from']}")
         if row["supersedes"]:
             lines.append(f"  Supersedes: #{row['supersedes']}")
+        for label, key in (("Author", "author"), ("Reference", "ref")):
+            if row[key]:
+                lines.append(f"  {label}: {row[key]}")
         lines.append(f"  Citation excerpt:\n    {row['excerpt']}")
     return "\n".join(lines)
 
 
 @mcp.tool()
-def log_decision(summary: str, reasoning: str, excerpt: str) -> str:
+def log_decision(
+    summary: str,
+    reasoning: str,
+    excerpt: str,
+    derives_from: int = 0,
+    cluster: str = "",
+    source: str = "",
+    ref: str = "",
+    author: str = "",
+) -> str:
     """Log a meaningful project decision at the moment it is made.
 
     Use for architecture choices, stack/library picks, approaches ruled out,
@@ -238,17 +333,46 @@ def log_decision(summary: str, reasoning: str, excerpt: str) -> str:
             they were rejected.
         excerpt: Verbatim, self-contained excerpt of the conversation where
             the decision happened — this is the citation.
+        derives_from: Id of the decision this one builds on, if any. Set it
+            whenever the reasoning refers back to an earlier decision — "given
+            we already chose X", "extends", "the follow-up to". This is what
+            connects the history into a tree instead of a flat list, so prefer
+            setting it over leaving it blank. Use supersede_decision instead
+            when the new decision *reverses* the earlier one.
+        cluster: Short theme this belongs to, reused across decisions in the
+            project — e.g. "Auth", "Content pipeline", "Landing page". Check
+            list_decisions for the labels already in use before inventing one.
+        source: Where it was decided: chat, code, pr, or doc.
+        ref: Pointer to the artifact — a PR number, file:line, ticket id, or
+            document section.
+        author: Who made the call, if known.
     """
+    parent = derives_from or None
     with closing(connect()) as conn, conn:
+        problem = check_context(conn, parent, cluster, source, ref, author)
+        if problem:
+            return problem
         cur = conn.execute(
-            "INSERT INTO decisions (summary, reasoning, excerpt, created_at) VALUES (?, ?, ?, ?)",
-            (summary, reasoning, excerpt, now()),
+            "INSERT INTO decisions (summary, reasoning, excerpt, created_at,"
+            " derives_from, cluster, source, ref, author)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (summary, reasoning, excerpt, now())
+            + context_columns(parent, cluster, source, ref, author),
         )
     return f"Logged decision #{cur.lastrowid}: {summary}"
 
 
 @mcp.tool()
-def supersede_decision(decision_id: int, summary: str, reasoning: str, excerpt: str) -> str:
+def supersede_decision(
+    decision_id: int,
+    summary: str,
+    reasoning: str,
+    excerpt: str,
+    cluster: str = "",
+    source: str = "",
+    ref: str = "",
+    author: str = "",
+) -> str:
     """Record a decision that reverses or replaces an earlier one.
 
     The old decision is kept in the timeline and marked superseded — nothing
@@ -260,6 +384,11 @@ def supersede_decision(decision_id: int, summary: str, reasoning: str, excerpt: 
         reasoning: Why the earlier decision no longer holds.
         excerpt: Verbatim excerpt of the conversation where the reversal
             happened.
+        cluster: Theme this belongs to. Defaults to the cluster of the
+            decision being replaced, which is almost always right.
+        source: Where it was decided: chat, code, pr, or doc.
+        ref: Pointer to the artifact — PR number, file:line, ticket, section.
+        author: Who made the call, if known.
     """
     with closing(connect()) as conn, conn:
         old = conn.execute("SELECT * FROM decisions WHERE id = ?", (decision_id,)).fetchone()
@@ -276,10 +405,18 @@ def supersede_decision(decision_id: int, summary: str, reasoning: str, excerpt: 
                 f"({old['retired_reason']}). A retired decision is not part of "
                 "this project's history, so there is nothing to supersede."
             )
+        # A replacement almost always belongs to the same theme as what it
+        # replaces, so inherit rather than making the caller repeat it.
+        cluster = cluster or (old["cluster"] or "")
+        problem = check_context(conn, None, cluster, source, ref, author)
+        if problem:
+            return problem
         cur = conn.execute(
-            "INSERT INTO decisions (summary, reasoning, excerpt, created_at, supersedes)"
-            " VALUES (?, ?, ?, ?, ?)",
-            (summary, reasoning, excerpt, now(), decision_id),
+            "INSERT INTO decisions (summary, reasoning, excerpt, created_at, supersedes,"
+            " derives_from, cluster, source, ref, author)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (summary, reasoning, excerpt, now(), decision_id)
+            + context_columns(None, cluster, source, ref, author),
         )
         conn.execute(
             "UPDATE decisions SET superseded_by = ? WHERE id = ?",
