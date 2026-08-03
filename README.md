@@ -403,6 +403,19 @@ session holds identity only and is tested to contain no credential.
 Auth0 needs the callback URL `https://<web-host>/auth/callback` registered on
 that application.
 
+### Deploying the web service
+
+```bash
+railway up web --path-as-root --ci --service decisiontree-web
+```
+
+**`--path-as-root` is not optional.** `railway up` archives from the git root,
+not the working directory, so running it from inside `web/` uploads the whole
+repository and Railway builds the *root* Dockerfile — deploying a second copy
+of the vault service under the web service's domain. It passes its health check
+and looks fine; the giveaway is `/login` returning `Not Found` and `/` serving
+the vault's JSON index.
+
 ## Tests
 
 ```bash
