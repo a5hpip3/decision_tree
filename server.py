@@ -17,7 +17,7 @@ import hashlib
 import os
 import re
 import sqlite3
-from contextlib import closing
+from contextlib import closing, contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -99,9 +99,109 @@ REMOTE_PROJECT: contextvars.ContextVar[str | None] = contextvars.ContextVar(
     "remote_project", default=None
 )
 
+# True when the request arrived on the project-less router endpoint, where the
+# caller names the project per call instead of the URL fixing it. A pinned
+# connector cannot be talked out of its project; the router has none to start
+# with, so every tool has to be told.
+ROUTER: contextvars.ContextVar[bool] = contextvars.ContextVar("router", default=False)
+
 # A remote project name becomes a filename, so it is validated rather than
 # sanitised — anything not matching this is rejected at the edge, never coerced.
 PROJECT_NAME = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
+
+
+def remote_projects() -> list[str]:
+    """Names of the hosted vaults on this machine's volume."""
+    directory = VAULT_HOME / "remote"
+    if not directory.is_dir():
+        return []
+    return sorted(
+        path.stem for path in directory.glob("*.db") if PROJECT_NAME.match(path.stem)
+    )
+
+
+def project_activity() -> list[tuple[str, int]]:
+    """(name, active count) for every hosted vault."""
+    out = []
+    for name in remote_projects():
+        token = REMOTE_PROJECT.set(name)
+        try:
+            with closing(connect()) as conn:
+                out.append(
+                    (name, conn.execute(f"SELECT COUNT(*) FROM decisions WHERE {ACTIVE}").fetchone()[0])
+                )
+        finally:
+            REMOTE_PROJECT.reset(token)
+    return out
+
+
+def suggest_projects() -> str:
+    """Project names worth offering, with empty vaults reduced to a count.
+
+    An empty vault is indistinguishable from a typo that was created by
+    accident, and listing them all crowds out the projects someone actually
+    means — this text is read by an agent choosing where to write.
+    """
+    activity = project_activity()
+    named = [name for name, active in activity if active]
+    empty = len(activity) - len(named)
+    if not named:
+        return "(none with decisions yet)"
+    text = ", ".join(named)
+    if empty:
+        text += f" (plus {empty} empty)"
+    return text
+
+
+@contextmanager
+def scoped(project: str = "", create: bool = False):
+    """Bind the vault this call should act on; yields an error string or None.
+
+    Over stdio and on a pinned connector the project is already decided, and an
+    explicit one is refused rather than honoured — silently writing somewhere
+    other than the URL says is the misfiling this design exists to prevent.
+    On the router the project is required, because nothing else supplies it.
+    """
+    pinned = REMOTE_PROJECT.get()
+
+    if not ROUTER.get():
+        if project:
+            where = f"this connector is pinned to {pinned}" if pinned else (
+                "this client resolves the project from the working directory"
+            )
+            yield (
+                f"Error: {where}, so the project argument does not apply. Omit it, "
+                "or connect to the router endpoint (/mcp) to choose a project per call."
+            )
+        else:
+            yield None
+        return
+
+    if not project:
+        yield (
+            "Error: this connector is not tied to a project, so this call needs "
+            f"project=<name>. Known projects: {suggest_projects()}. "
+            "Ask which one before guessing."
+        )
+        return
+
+    if not PROJECT_NAME.match(project):
+        yield f"Error: {project!r} is not a valid project name ({PROJECT_NAME.pattern})."
+        return
+
+    if project not in remote_projects() and not create:
+        yield (
+            f"Error: no project named {project!r}. Known projects: "
+            f"{suggest_projects()}. Pass create=true to start a new one — but "
+            "check for a typo first."
+        )
+        return
+
+    token = REMOTE_PROJECT.set(project)
+    try:
+        yield None
+    finally:
+        REMOTE_PROJECT.reset(token)
 
 
 def project_root() -> Path:
@@ -403,6 +503,8 @@ def log_decision(
     ref: str = "",
     author: str = "",
     created_at: str = "",
+    project: str = "",
+    create: bool = False,
 ) -> str:
     """Log a meaningful project decision at the moment it is made.
 
@@ -432,7 +534,24 @@ def log_decision(
         created_at: Leave empty. The server stamps the time. Set it only when
             importing a decision that was recorded somewhere else and whose
             real date matters, as an ISO 8601 timestamp.
+        project: Which project to act on. Required only on the router
+            connector (a URL with no /p/<project>/ in it); omit it everywhere
+            else. Call list_projects first and ask which one rather than
+            guessing.
+        create: Start a project that does not exist yet. Only set this when you
+            mean to; an unrecognised name is far more often a typo.
     """
+    with scoped(project, create) as problem:
+        return problem or _write_decision(
+            summary, reasoning, excerpt, derives_from, cluster, source, ref,
+            author, created_at,
+        )
+
+
+def _write_decision(
+    summary, reasoning, excerpt, derives_from, cluster, source, ref, author, created_at
+) -> str:
+    """Insert one decision into whichever vault is currently bound."""
     parent = derives_from or None
     with closing(connect()) as conn, conn:
         problem = check_context(conn, parent, cluster, source, ref, author)
@@ -462,6 +581,7 @@ def supersede_decision(
     source: str = "",
     ref: str = "",
     author: str = "",
+    project: str = "",
 ) -> str:
     """Record a decision that reverses or replaces an earlier one.
 
@@ -479,7 +599,15 @@ def supersede_decision(
         source: Where it was decided: chat, code, pr, or doc.
         ref: Pointer to the artifact — PR number, file:line, ticket, section.
         author: Who made the call, if known.
+        project: Which project to act on. Required only on the router
+            connector (a URL with no /p/<project>/ in it); omit it everywhere
+            else. Call list_projects first if you are unsure of the name.
     """
+    with scoped(project) as problem:
+        return problem or _supersede_decision(decision_id, summary, reasoning, excerpt, cluster, source, ref, author)
+
+
+def _supersede_decision(decision_id, summary, reasoning, excerpt, cluster, source, ref, author) -> str:
     with closing(connect()) as conn, conn:
         old = conn.execute("SELECT * FROM decisions WHERE id = ?", (decision_id,)).fetchone()
         if old is None:
@@ -519,7 +647,7 @@ def supersede_decision(
 
 
 @mcp.tool()
-def retire_decision(decision_id: int, reason: str) -> str:
+def retire_decision(decision_id: int, reason: str, project: str = "") -> str:
     """Mark a decision as filed in error, without deleting it.
 
     Use only when a decision does not belong in this project at all — for
@@ -534,7 +662,15 @@ def retire_decision(decision_id: int, reason: str) -> str:
     Args:
         decision_id: The id of the decision to retire.
         reason: Why it does not belong here, e.g. where it was moved to.
+        project: Which project to act on. Required only on the router
+            connector (a URL with no /p/<project>/ in it); omit it everywhere
+            else. Call list_projects first if you are unsure of the name.
     """
+    with scoped(project) as problem:
+        return problem or _retire_decision(decision_id, reason)
+
+
+def _retire_decision(decision_id, reason) -> str:
     with closing(connect()) as conn, conn:
         row = conn.execute("SELECT * FROM decisions WHERE id = ?", (decision_id,)).fetchone()
         if row is None:
@@ -552,13 +688,21 @@ def retire_decision(decision_id: int, reason: str) -> str:
 
 
 @mcp.tool()
-def list_decisions(include_superseded: bool = False) -> str:
+def list_decisions(include_superseded: bool = False, project: str = "") -> str:
     """List this project's decision timeline, newest first.
 
     Args:
         include_superseded: Include superseded decisions to see the full
             history, not just the current state.
+        project: Which project to act on. Required only on the router
+            connector (a URL with no /p/<project>/ in it); omit it everywhere
+            else. Call list_projects first if you are unsure of the name.
     """
+    with scoped(project) as problem:
+        return problem or _list_decisions(include_superseded)
+
+
+def _list_decisions(include_superseded) -> str:
     query = "SELECT * FROM decisions"
     if not include_superseded:
         query += f" WHERE {ACTIVE}"
@@ -571,12 +715,20 @@ def list_decisions(include_superseded: bool = False) -> str:
 
 
 @mcp.tool()
-def get_decision(decision_id: int) -> str:
+def get_decision(decision_id: int, project: str = "") -> str:
     """Get the full record of one decision, including its citation excerpt.
 
     Args:
         decision_id: The id of the decision to fetch.
+        project: Which project to act on. Required only on the router
+            connector (a URL with no /p/<project>/ in it); omit it everywhere
+            else. Call list_projects first if you are unsure of the name.
     """
+    with scoped(project) as problem:
+        return problem or _get_decision(decision_id)
+
+
+def _get_decision(decision_id) -> str:
     with closing(connect()) as conn:
         row = conn.execute("SELECT * FROM decisions WHERE id = ?", (decision_id,)).fetchone()
     if row is None:
@@ -585,13 +737,23 @@ def get_decision(decision_id: int) -> str:
 
 
 @mcp.tool()
-def get_project_brief() -> str:
+def get_project_brief(project: str = "") -> str:
     """Catch me up: this project's active decisions with reasoning, oldest first.
 
     Call this at the start of a session to load the current state of the
     project. Superseded decisions are excluded; use list_decisions with
     include_superseded=true to see how the project got here.
+
+    Args:
+        project: Which project to act on. Required only on the router
+            connector (a URL with no /p/<project>/ in it); omit it everywhere
+            else. Call list_projects first if you are unsure of the name.
     """
+    with scoped(project) as problem:
+        return problem or _get_project_brief()
+
+
+def _get_project_brief() -> str:
     label = project_label()
     with closing(connect()) as conn:
         rows = conn.execute(
@@ -626,6 +788,52 @@ def get_project_brief() -> str:
     if history:
         parts.append(history)
     return "\n".join(parts)
+
+
+@mcp.tool()
+def list_projects() -> str:
+    """List the hosted projects and how much is in each.
+
+    Use this before logging on a connector that is not tied to a project, so
+    the project argument is a real name rather than a guess — and show the list
+    to the user and ask which one if it is not obvious from the conversation.
+    """
+    activity = dict(project_activity())
+    names = [name for name, active in activity.items() if active]
+    empty = [name for name, active in activity.items() if not active]
+    if not names:
+        return "No hosted projects with decisions yet."
+
+    lines = []
+    for name in names:
+        token = REMOTE_PROJECT.set(name)
+        try:
+            with closing(connect()) as conn:
+                active = conn.execute(
+                    f"SELECT COUNT(*) FROM decisions WHERE {ACTIVE}"
+                ).fetchone()[0]
+                latest = conn.execute(
+                    f"SELECT MAX(created_at) FROM decisions WHERE {ACTIVE}"
+                ).fetchone()[0]
+                clusters = [
+                    r[0]
+                    for r in conn.execute(
+                        f"SELECT DISTINCT cluster FROM decisions"
+                        f" WHERE cluster IS NOT NULL AND {ACTIVE} ORDER BY cluster"
+                    )
+                ]
+        finally:
+            REMOTE_PROJECT.reset(token)
+        detail = f"{active} active"
+        if latest:
+            detail += f", last {latest[:10]}"
+        if clusters:
+            detail += f" — {', '.join(clusters[:5])}"
+        lines.append(f"- {name} ({detail})")
+    text = "Hosted projects:\n" + "\n".join(lines)
+    if empty:
+        text += f"\n\n({len(empty)} empty: {', '.join(empty)})"
+    return text
 
 
 @mcp.tool()

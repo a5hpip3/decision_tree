@@ -83,6 +83,8 @@ def describe_token(token: str) -> str:
 
 MCP_SUFFIX = "/mcp"
 PREFIX = "/p/"
+# The project-less endpoint: one connector, project named per call.
+ROUTER_PATH = "/mcp"
 
 
 def parse_project(path: str) -> str | None:
@@ -116,12 +118,20 @@ def request_origin(scope) -> str:
     return f"{scheme.split(',')[0].strip()}://{host}"
 
 
-def resource_url_for(scope, project: str) -> str:
+def resource_url_for(scope, project):
+    """The canonical URI of the endpoint being addressed.
+
+    The router has no project, so its resource is the bare /mcp URL — an
+    OAuth audience still has to identify something."""
+    if project is None:
+        return f"{request_origin(scope)}{ROUTER_PATH}"
     return f"{request_origin(scope)}{PREFIX}{project}{MCP_SUFFIX}"
 
 
-def metadata_url_for(scope, project: str) -> str:
-    """Per-project metadata location, mirroring the MCP path underneath it."""
+def metadata_url_for(scope, project):
+    """Per-endpoint metadata location, mirroring the MCP path underneath it."""
+    if project is None:
+        return f"{request_origin(scope)}{WELL_KNOWN_PRM}{ROUTER_PATH}"
     return f"{request_origin(scope)}{WELL_KNOWN_PRM}{PREFIX}{project}{MCP_SUFFIX}"
 
 
@@ -134,6 +144,7 @@ async def index(_request):
         {
             "service": "decisiontree",
             "connect": "/p/<project>/mcp",
+            "router": "/mcp",
             "project_name": server.PROJECT_NAME.pattern,
         }
     )
@@ -262,12 +273,13 @@ def build_app(
             await _api_response(scope, receive, send, path, token, oauth_config, verifier)
             return
 
-        if not path.startswith(PREFIX):
+        router = path == ROUTER_PATH
+        if not router and not path.startswith(PREFIX):
             await shell(scope, receive, send)
             return
 
-        project = parse_project(path)
-        if project is None:
+        project = None if router else parse_project(path)
+        if not router and project is None:
             await JSONResponse(
                 {"error": "invalid project", "expected": "/p/<project>/mcp"},
                 status_code=404,
@@ -282,11 +294,14 @@ def build_app(
         # Hand the MCP app the path it expects, and publish the project for the
         # duration of this request.
         inner = dict(scope, path=MCP_SUFFIX, raw_path=MCP_SUFFIX.encode())
-        reset = server.REMOTE_PROJECT.set(project)
+        router_token = server.ROUTER.set(router)
+        project_token = None if router else server.REMOTE_PROJECT.set(project)
         try:
             await mcp_app(inner, receive, send)
         finally:
-            server.REMOTE_PROJECT.reset(reset)
+            server.ROUTER.reset(router_token)
+            if project_token is not None:
+                server.REMOTE_PROJECT.reset(project_token)
 
     return app
 
@@ -389,18 +404,20 @@ async def _metadata_response(scope, receive, send, path, oauth_config):
 
     suffix = path[len(WELL_KNOWN_PRM) :]
     # Claude probes the path-suffixed document first, then the bare one.
-    project = parse_project(suffix) if suffix else None
-    if project is None and suffix not in ("", "/"):
+    router = suffix == ROUTER_PATH
+    project = None if router else (parse_project(suffix) if suffix else None)
+    if not router and project is None and suffix not in ("", "/"):
         await JSONResponse({"error": "unknown resource"}, status_code=404)(
             scope, receive, send
         )
         return
 
-    resource = (
-        resource_url_for(scope, project)
-        if project
-        else f"{request_origin(scope)}{PREFIX}<project>{MCP_SUFFIX}"
-    )
+    if router:
+        resource = f"{request_origin(scope)}{ROUTER_PATH}"
+    elif project:
+        resource = resource_url_for(scope, project)
+    else:
+        resource = f"{request_origin(scope)}{PREFIX}<project>{MCP_SUFFIX}"
     await JSONResponse(oauth.protected_resource_metadata(resource, oauth_config))(
         scope, receive, send
     )

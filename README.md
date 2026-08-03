@@ -121,6 +121,28 @@ the mount itself.
 The domain is needed *before* the server will answer, but only exists *after*
 the first deploy, so the sequence above deploys twice on purpose.
 
+### Two ways to address a project
+
+| Endpoint | Project comes from | Suits |
+|---|---|---|
+| `/p/<project>/mcp` | the URL, fixed | Claude Code, one repo per connector |
+| `/mcp` (router) | a `project` argument on each call | chat, where one connector serves every project |
+
+A connector is account-level configuration, so a pinned URL means one project
+for every conversation that uses it. That is right for a repo and wrong for
+chat, where the subject changes between messages. On the router, `list_projects`
+returns the real names so the agent can ask which one rather than guess.
+
+The two do not blur into each other. A pinned connector **refuses** a `project`
+argument rather than honouring it — silently writing somewhere other than the
+URL says is exactly the misfiling this design exists to prevent. On the router
+an unrecognised name is refused with the known ones listed, because a typo is
+far more likely than a new project; `create=true` starts one deliberately.
+
+Empty vaults are demoted to a footnote in every list an agent sees. An empty
+project is indistinguishable from one created by accident, and crowding the
+suggestions with them makes a wrong choice more likely.
+
 ### OAuth with Auth0
 
 Context Vault never issues tokens. It is a *protected resource*: Auth0 is the
