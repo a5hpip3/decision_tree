@@ -368,6 +368,41 @@ Auth reuses `CONTEXT_VAULT_TOKEN`. A JWT is accepted only when a single fixed
 cross-project and have no per-project resource URL to check an audience
 against.
 
+## Web front-end (`web/`)
+
+A separate Railway service, because a volume mounts to one service and this one
+holds no data — it reads the vault through the [read API](#read-api).
+
+```
+browser --session cookie--> decisiontree-web --bearer token--> vault API
+```
+
+The vault token lives only in the web service. It is never sent to the browser,
+never embedded in a page, and the proxy forwards only `GET` to two fixed path
+shapes — an open proxy carrying a credential would be worse than no auth at all.
+
+| Env var | Purpose |
+|---|---|
+| `AUTH0_ISSUER` | e.g. `https://decisiontree.us.auth0.com/` |
+| `AUTH0_CLIENT_ID` / `AUTH0_CLIENT_SECRET` | a **Regular Web Application** in Auth0 (confidential client) |
+| `VAULT_API_URL` | the vault service's base URL |
+| `VAULT_API_TOKEN` | `CONTEXT_VAULT_TOKEN` from the vault service |
+| `SESSION_SECRET` | signs session cookies |
+| `WEB_ALLOWED_EMAILS` | comma-separated addresses permitted to sign in |
+| `SESSION_INSECURE_COOKIE` | `true` only for local http development |
+
+**`WEB_ALLOWED_EMAILS` fails closed.** With it unset, every sign-in is refused.
+An Auth0 tenant will happily let a stranger sign up through a social
+connection, and what is behind this door is decision reasoning and verbatim
+transcript excerpts. A refused login reports the address it refused, so a wrong
+account is distinguishable from a missing allowlist entry.
+
+Sessions are signed, not encrypted — the browser can read the payload — so the
+session holds identity only and is tested to contain no credential.
+
+Auth0 needs the callback URL `https://<web-host>/auth/callback` registered on
+that application.
+
 ## Tests
 
 ```bash

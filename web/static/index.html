@@ -1,0 +1,35 @@
+<!doctype html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>DecisionTree</title>
+<style>
+  body { margin:0; background:#F4F0E8; color:#1C1917;
+         font-family:'IBM Plex Mono', ui-monospace, monospace; padding:40px; }
+  h1 { font-weight:600; font-size:15px; letter-spacing:.08em; text-transform:uppercase; }
+  table { border-collapse:collapse; margin-top:20px; font-size:13px; }
+  th, td { text-align:left; padding:7px 18px 7px 0; border-bottom:1px solid #E2DACD; }
+  th { font-weight:500; color:#7A7166; }
+  a { color:#A85C3A; }
+  .muted { color:#A9A198; }
+</style>
+<h1>DecisionTree</h1>
+<p class="muted" id="who"></p>
+<table id="projects"><thead><tr>
+  <th>Project</th><th>Active</th><th>Superseded</th><th>Retired</th><th>Clusters</th><th>Last activity</th>
+</tr></thead><tbody></tbody></table>
+<p class="muted">Stage 3 placeholder — the graph lands in Stage 4. <a href="/logout">Sign out</a></p>
+<script>
+(async () => {
+  const me = await fetch('/whoami').then(r => r.ok ? r.json() : null);
+  if (me) document.getElementById('who').textContent = 'Signed in as ' + (me.email || '');
+  const data = await fetch('/api/projects').then(r => r.json());
+  const body = document.querySelector('#projects tbody');
+  for (const p of (data.projects || [])) {
+    const row = document.createElement('tr');
+    row.innerHTML = `<td>${p.name}</td><td>${p.active}</td><td>${p.superseded}</td>` +
+      `<td>${p.retired}</td><td>${(p.clusters || []).join(', ')}</td>` +
+      `<td class="muted">${p.last_activity || '—'}</td>`;
+    body.appendChild(row);
+  }
+})();
+</script>
