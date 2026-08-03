@@ -458,6 +458,20 @@ Fields the vault does not carry yet are hidden rather than faked: with no
 clusters or sources, those rail sections simply do not render. A filter over a
 column that is always null is worse than no filter.
 
+**Nodes can be dragged.** The force layout is a starting arrangement, not a
+verdict — drag a card and it stays where you put it, with its edges following.
+A drag under 4px counts as a click, so selecting a node still works. Positions
+are kept per project in `localStorage`, because an arrangement that vanished on
+the next filter change or reload would not be worth making. `RESET` appears
+once anything has moved and returns to the computed layout.
+
+During a drag the card and its edges are moved directly rather than
+re-rendering: a full repaint per mouse move would rebuild the DOM, and
+re-running the force simulation would fight the drag by pulling the node back.
+
+Note the front-end has no automated tests — it is verified by rendering real
+vault data in a browser.
+
 ### Deploying the web service
 
 ```bash

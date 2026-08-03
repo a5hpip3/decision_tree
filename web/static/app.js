@@ -28,6 +28,7 @@ const state = {
   clusters: [], sources: [],
   query: '', statusOff: {}, sourceOff: {}, clusterOff: {},
   selected: null, panelOpen: false,
+  moved: {},          // id -> {x, y}: positions the user dragged, in world space
   tx: 40, ty: 20, scale: 0.82,
   loading: true, error: null, user: null,
 };
@@ -57,11 +58,44 @@ async function loadProject(name) {
   state.sources = data.sources || [];
   state.selected = null; state.panelOpen = false;
   state.statusOff = {}; state.sourceOff = {}; state.clusterOff = {};
+  state.moved = loadMoved(name);
   state.loading = false;
   layoutCache.key = null;
   render();
   queueFit();
 }
+
+/* ---------------------------------------------------------- arrangement --- */
+
+/* A dragged arrangement is the user's own work — losing it on a filter change
+ * or a page reload would make dragging pointless, so it is kept per project. */
+
+const movedKey = name => `decisiontree:moved:${name}`;
+
+function loadMoved(name) {
+  try {
+    return JSON.parse(localStorage.getItem(movedKey(name)) || '{}');
+  } catch {
+    return {};
+  }
+}
+
+function saveMoved() {
+  if (!state.project) return;
+  try {
+    if (Object.keys(state.moved).length) {
+      localStorage.setItem(movedKey(state.project), JSON.stringify(state.moved));
+    } else {
+      localStorage.removeItem(movedKey(state.project));
+    }
+  } catch {
+    /* storage disabled or full — the arrangement just won't outlive the tab */
+  }
+}
+
+/** Where a node actually sits: the dragged position if there is one, else the
+ *  position the force layout computed. */
+const nodePos = (id, pos) => state.moved[id] || pos['d:' + id];
 
 /* -------------------------------------------------------------- helpers --- */
 
@@ -179,7 +213,7 @@ function layout(list) {
 function bbox(list, pos) {
   let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
   list.forEach(d => {
-    const p = pos['d:' + d.id]; if (!p) return;
+    const p = nodePos(d.id, pos); if (!p) return;
     x0 = Math.min(x0, p.x); y0 = Math.min(y0, p.y);
     x1 = Math.max(x1, p.x + NW); y1 = Math.max(y1, p.y + NH);
   });
@@ -352,6 +386,26 @@ function renderRail(colours) {
     projects, body, foot, account]);
 }
 
+/* Live references into the rendered canvas so a drag can move one node and its
+ * edges without re-rendering the whole graph on every mouse move. */
+const refs = { nodes: {}, lines: [] };
+
+function endpoint(id, pos) {
+  if (id.startsWith('d:')) {
+    const p = nodePos(Number(id.slice(2)), pos);
+    return p && { x: p.x + NW / 2, y: p.y + NH / 2 };
+  }
+  return pos[id];
+}
+
+function placeLine(entry, pos) {
+  const a = endpoint(entry.a, pos), b = endpoint(entry.b, pos);
+  if (!a || !b) return false;
+  entry.el.setAttribute('x1', a.x); entry.el.setAttribute('y1', a.y);
+  entry.el.setAttribute('x2', b.x); entry.el.setAttribute('y2', b.y);
+  return true;
+}
+
 function renderCanvas(colours) {
   const list = visible();
   const canvas = el('div', {
@@ -388,20 +442,15 @@ function renderCanvas(colours) {
   svg.setAttribute('style', 'position:absolute;left:0;top:0;overflow:visible;pointer-events:none');
   svg.setAttribute('width', '1');
   svg.setAttribute('height', '1');
+  refs.lines = [];
   links.forEach(l => {
-    const a = pos[l.a], b = pos[l.b];
-    if (!a || !b) return;
-    const structural = !l.kind;
     const line = document.createElementNS('http://www.w3.org/2000/svg', 'line');
-    const ax = a.x + (l.a.startsWith('d:') ? NW / 2 : 0);
-    const ay = a.y + (l.a.startsWith('d:') ? NH / 2 : 0);
-    const bx = b.x + (l.b.startsWith('d:') ? NW / 2 : 0);
-    const by = b.y + (l.b.startsWith('d:') ? NH / 2 : 0);
-    line.setAttribute('x1', ax); line.setAttribute('y1', ay);
-    line.setAttribute('x2', bx); line.setAttribute('y2', by);
-    line.setAttribute('stroke', l.kind === 'supersedes' ? '#C9B79E' : structural ? '#E2DACD' : '#CBBFAC');
+    line.setAttribute('stroke', l.kind === 'supersedes' ? '#C9B79E' : l.kind ? '#CBBFAC' : '#E2DACD');
     line.setAttribute('stroke-width', l.kind === 'derives' ? 1.2 : 1);
     if (l.kind === 'supersedes') line.setAttribute('stroke-dasharray', '3 3');
+    const entry = { el: line, a: l.a, b: l.b };
+    if (!placeLine(entry, pos)) return;
+    refs.lines.push(entry);
     svg.appendChild(line);
   });
   world.appendChild(svg);
@@ -416,17 +465,17 @@ function renderCanvas(colours) {
     }, name));
   });
 
+  refs.nodes = {};
   list.forEach(d => {
-    const p = pos['d:' + d.id];
+    const p = nodePos(d.id, pos);
     if (!p) return;
     const chosen = state.selected && state.selected.id === d.id;
     const dim = d.status === 'superseded';
     const colour = colours[clusterOf(d)];
-    world.appendChild(el('div', {
+    const card = el('div', {
       class: 'node',
       style: `left:${p.x}px;top:${p.y}px;border:1px solid ${chosen ? '#A85C3A' : '#E2DACD'};` +
              `opacity:${dim ? 0.55 : 1};box-shadow:${chosen ? '0 8px 22px rgba(28,25,23,.13)' : 'none'}`,
-      onClick: e => { e.stopPropagation(); select(d); },
     }, [
       el('div', { class: 'node-meta' }, [
         d.source ? el('span', { class: 'tag' }, SOURCE_LABEL[d.source] || d.source.toUpperCase()) : null,
@@ -440,7 +489,10 @@ function renderCanvas(colours) {
         el('span', { style: `width:5px;height:5px;background:${colour}` }),
         el('span', { style: 'font-size:8.5px;letter-spacing:.13em;text-transform:uppercase;color:#A0988E' }, d.cluster),
       ]) : null,
-    ]));
+    ]);
+    card.addEventListener('mousedown', e => startNodeDrag(e, d, p));
+    refs.nodes[d.id] = card;
+    world.appendChild(card);
   });
 
   canvas.appendChild(world);
@@ -450,6 +502,12 @@ function renderCanvas(colours) {
     el('div', { class: 'zoom-btn', title: 'Zoom out', onClick: () => zoomBy(0.9) }, '−'),
     el('div', { class: 'zoom-btn', title: 'Zoom in', onClick: () => zoomBy(1.1) }, '+'),
     el('div', { class: 'zoom-btn', title: 'Fit', style: 'width:auto;padding:0 8px;font-size:9px;letter-spacing:.1em', onClick: () => fit() }, 'FIT'),
+    Object.keys(state.moved).length ? el('div', {
+      class: 'zoom-btn',
+      title: 'Discard your arrangement and return to the computed layout',
+      style: 'width:auto;padding:0 8px;font-size:9px;letter-spacing:.1em',
+      onClick: () => { state.moved = {}; saveMoved(); render(); queueFit(); },
+    }, 'RESET') : null,
   ]));
 
   if (state.panelOpen && state.selected) canvas.appendChild(renderPanel(colours));
@@ -562,7 +620,67 @@ function zoomBy(factor) {
 
 /* ------------------------------------------------------------ interaction - */
 
-let drag = null;
+let drag = null;      // panning the canvas
+let nodeDrag = null;  // repositioning one node
+
+// Below this many pixels of movement a mousedown/up is a click, not a drag.
+// Without it, the tiny wobble in a real click swallows every selection.
+const DRAG_THRESHOLD = 4;
+
+function startNodeDrag(event, decision, position) {
+  if (event.button !== 0) return;
+  event.preventDefault();
+  event.stopPropagation();
+  nodeDrag = {
+    decision,
+    startX: event.clientX, startY: event.clientY,
+    originX: position.x, originY: position.y,
+    dragged: false,
+  };
+}
+
+function moveNode(event) {
+  const dx = (event.clientX - nodeDrag.startX) / state.scale;
+  const dy = (event.clientY - nodeDrag.startY) / state.scale;
+  if (!nodeDrag.dragged &&
+      Math.hypot(event.clientX - nodeDrag.startX, event.clientY - nodeDrag.startY) < DRAG_THRESHOLD) {
+    return;
+  }
+  if (!nodeDrag.dragged) {
+    nodeDrag.dragged = true;
+    document.body.style.cursor = 'grabbing';
+    const card = refs.nodes[nodeDrag.decision.id];
+    if (card) card.classList.add('dragging');
+  }
+
+  const id = nodeDrag.decision.id;
+  const next = { x: nodeDrag.originX + dx, y: nodeDrag.originY + dy };
+  state.moved[id] = next;
+
+  // Move the card and its edges directly. A full re-render per mouse move
+  // would rebuild the DOM — and re-running the force layout would fight the
+  // drag by pulling the node back.
+  const card = refs.nodes[id];
+  if (card) { card.style.left = `${next.x}px`; card.style.top = `${next.y}px`; }
+  const { pos } = layout(visible());
+  const key = 'd:' + id;
+  refs.lines.forEach(entry => {
+    if (entry.a === key || entry.b === key) placeLine(entry, pos);
+  });
+}
+
+function endNodeDrag() {
+  const finished = nodeDrag;
+  nodeDrag = null;
+  if (!finished) return;
+  document.body.style.cursor = '';
+  if (finished.dragged) {
+    saveMoved();
+    render();          // repaint once, so the panel and rail see the new state
+  } else {
+    select(finished.decision);
+  }
+}
 
 function wireCanvas() {
   const canvas = document.getElementById('canvas');
@@ -587,6 +705,7 @@ function wireCanvas() {
 }
 
 window.addEventListener('mousemove', e => {
+  if (nodeDrag) { moveNode(e); return; }
   if (!drag) return;
   state.tx = e.clientX - drag.x;
   state.ty = e.clientY - drag.y;
@@ -594,6 +713,7 @@ window.addEventListener('mousemove', e => {
 });
 
 window.addEventListener('mouseup', () => {
+  if (nodeDrag) { endNodeDrag(); return; }
   drag = null;
   const canvas = document.getElementById('canvas');
   if (canvas) canvas.style.cursor = 'grab';
