@@ -194,3 +194,73 @@ class TestMigration:
         # And the new fields work on the upgraded vault.
         second = log("Follow-up", derives_from=1, cluster="Engine", source="pr")
         assert "Derives from: #1" in get_decision(second)
+
+
+class TestCreatedAt:
+    """An explicit timestamp exists for importing history recorded elsewhere."""
+
+    def test_defaults_to_now(self, vault):
+        vault.enter(vault.project())
+        did = log()
+        with sqlite3.connect(server.db_path()) as conn:
+            stamp = conn.execute(
+                "SELECT created_at FROM decisions WHERE id = ?", (did,)
+            ).fetchone()[0]
+        assert stamp.startswith("20")
+
+    def test_preserves_an_explicit_timestamp(self, vault):
+        vault.enter(vault.project())
+        did = log(created_at="2026-08-02T18:53:22+00:00")
+        with sqlite3.connect(server.db_path()) as conn:
+            stamp = conn.execute(
+                "SELECT created_at FROM decisions WHERE id = ?", (did,)
+            ).fetchone()[0]
+        assert stamp == "2026-08-02T18:53:22+00:00"
+
+    def test_naive_timestamps_are_treated_as_utc(self, vault):
+        vault.enter(vault.project())
+        did = log(created_at="2026-08-02T18:53:22")
+        with sqlite3.connect(server.db_path()) as conn:
+            stamp = conn.execute(
+                "SELECT created_at FROM decisions WHERE id = ?", (did,)
+            ).fetchone()[0]
+        assert stamp == "2026-08-02T18:53:22+00:00"
+
+    def test_other_offsets_are_normalised_to_utc(self, vault):
+        vault.enter(vault.project())
+        did = log(created_at="2026-08-02T20:53:22+02:00")
+        with sqlite3.connect(server.db_path()) as conn:
+            stamp = conn.execute(
+                "SELECT created_at FROM decisions WHERE id = ?", (did,)
+            ).fetchone()[0]
+        assert stamp == "2026-08-02T18:53:22+00:00"
+
+    def test_rejects_a_malformed_timestamp(self, vault):
+        vault.enter(vault.project())
+        result = log_decision("x", "y", "z", created_at="last tuesday")
+        assert result.startswith("Error: created_at")
+        assert "ISO 8601" in result
+
+    def test_rejects_a_future_timestamp(self, vault):
+        """A future date would sort above everything in the timeline."""
+        vault.enter(vault.project())
+        result = log_decision("x", "y", "z", created_at="2099-01-01T00:00:00+00:00")
+        assert result.startswith("Error: created_at")
+        assert "future" in result
+
+    def test_nothing_is_written_when_the_timestamp_is_rejected(self, vault):
+        vault.enter(vault.project())
+        log_decision("Rejected", "y", "z", created_at="nonsense")
+        assert "Rejected" not in list_decisions()
+
+    def test_ordering_follows_the_imported_dates(self, vault):
+        """The point of the field: a real timeline after an import."""
+        vault.enter(vault.project())
+        log("Older", created_at="2026-01-01T00:00:00+00:00")
+        log("Newer", created_at="2026-06-01T00:00:00+00:00")
+        with sqlite3.connect(server.db_path()) as conn:
+            rows = [
+                r[0]
+                for r in conn.execute("SELECT summary FROM decisions ORDER BY created_at")
+            ]
+        assert rows == ["Older", "Newer"]

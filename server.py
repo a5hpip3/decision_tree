@@ -18,7 +18,7 @@ import os
 import re
 import sqlite3
 from contextlib import closing
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 try:  # mcp >= 2.0
@@ -229,6 +229,30 @@ def migrate(conn: sqlite3.Connection) -> None:
                 conn.execute(f"ALTER TABLE decisions ADD COLUMN {name} {decl}")
 
 
+def normalise_created_at(value: str) -> tuple[str | None, str | None]:
+    """Resolve the timestamp for a new decision; returns (stamp, error).
+
+    Blank means now, which is the normal case. An explicit value exists for
+    importing history recorded elsewhere, so it is validated rather than
+    trusted: a future timestamp would sort a decision above everything and a
+    malformed one would break the timeline it exists to preserve.
+    """
+    if not value.strip():
+        return now(), None
+    try:
+        parsed = datetime.fromisoformat(value.strip())
+    except ValueError:
+        return None, (
+            f"Error: created_at {value!r} is not an ISO 8601 timestamp "
+            "(expected e.g. 2026-08-02T18:53:22+00:00)."
+        )
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    if parsed > datetime.now(timezone.utc) + timedelta(minutes=1):
+        return None, f"Error: created_at {value!r} is in the future."
+    return parsed.astimezone(timezone.utc).isoformat(timespec="seconds"), None
+
+
 def check_context(
     conn: sqlite3.Connection,
     derives_from: int | None,
@@ -320,6 +344,7 @@ def log_decision(
     source: str = "",
     ref: str = "",
     author: str = "",
+    created_at: str = "",
 ) -> str:
     """Log a meaningful project decision at the moment it is made.
 
@@ -346,17 +371,23 @@ def log_decision(
         ref: Pointer to the artifact — a PR number, file:line, ticket id, or
             document section.
         author: Who made the call, if known.
+        created_at: Leave empty. The server stamps the time. Set it only when
+            importing a decision that was recorded somewhere else and whose
+            real date matters, as an ISO 8601 timestamp.
     """
     parent = derives_from or None
     with closing(connect()) as conn, conn:
         problem = check_context(conn, parent, cluster, source, ref, author)
         if problem:
             return problem
+        stamp, problem = normalise_created_at(created_at)
+        if problem:
+            return problem
         cur = conn.execute(
             "INSERT INTO decisions (summary, reasoning, excerpt, created_at,"
             " derives_from, cluster, source, ref, author)"
             " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (summary, reasoning, excerpt, now())
+            (summary, reasoning, excerpt, stamp)
             + context_columns(parent, cluster, source, ref, author),
         )
     return f"Logged decision #{cur.lastrowid}: {summary}"
