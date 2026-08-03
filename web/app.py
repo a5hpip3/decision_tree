@@ -98,6 +98,23 @@ def current_user(request) -> dict | None:
     return request.session.get("user")
 
 
+def external_base(request) -> str:
+    """The scheme://host a browser actually used to reach us.
+
+    Railway terminates TLS, so the app sees plain http and would otherwise
+    build an http:// callback URL — which Auth0 rejects as a mismatch against
+    the registered https one, with an error that names neither cause.
+    """
+    headers = request.headers
+    host = headers.get("x-forwarded-host") or headers.get("host") or request.url.netloc
+    scheme = headers.get("x-forwarded-proto") or request.url.scheme
+    return f"{scheme.split(',')[0].strip()}://{host}"
+
+
+def callback_url(request) -> str:
+    return f"{external_base(request)}/auth/callback"
+
+
 def build_app(config: Config | None = None, oauth=None) -> Starlette:
     """Build the ASGI app.
 
@@ -136,7 +153,7 @@ def build_app(config: Config | None = None, oauth=None) -> Starlette:
             return JSONResponse(
                 {"error": "not configured", "missing": config.missing()}, status_code=500
             )
-        redirect_uri = str(request.url_for("callback"))
+        redirect_uri = callback_url(request)
         return await oauth.auth0.authorize_redirect(request, redirect_uri)
 
     async def callback(request):
@@ -169,7 +186,7 @@ def build_app(config: Config | None = None, oauth=None) -> Starlette:
         request.session.clear()
         if not config.issuer or not config.client_id:
             return RedirectResponse("/")
-        returning = str(request.base_url).rstrip("/")
+        returning = external_base(request)
         return RedirectResponse(
             f"{config.issuer}/v2/logout?client_id={config.client_id}&returnTo={returning}"
         )
@@ -239,4 +256,8 @@ if __name__ == "__main__":
         app,
         host=os.environ.get("HOST", "0.0.0.0"),
         port=int(os.environ.get("PORT", "8000")),
+        # Railway's edge is the only thing that can reach this container, and
+        # uvicorn ignores X-Forwarded-* unless the peer is explicitly trusted.
+        proxy_headers=True,
+        forwarded_allow_ips=os.environ.get("FORWARDED_ALLOW_IPS", "*"),
     )

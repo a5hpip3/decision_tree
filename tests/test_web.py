@@ -276,3 +276,45 @@ class TestCookieSecurity:
         assert "ash@example.com" in decoded
         assert BASE_ENV["VAULT_API_TOKEN"] not in decoded
         assert BASE_ENV["AUTH0_CLIENT_SECRET"] not in decoded
+
+
+class TestForwardedHeaders:
+    """Railway terminates TLS, so the app sees http. Every externally visible
+    URL it builds must still be the https one the browser used — Auth0 rejects
+    a callback that doesn't match what was registered."""
+
+    def _request(self, headers):
+        class FakeURL:
+            scheme = "http"
+            netloc = "internal:8000"
+
+        class FakeRequest:
+            def __init__(self, headers):
+                self.headers = headers
+                self.url = FakeURL()
+
+        return FakeRequest(headers)
+
+    def test_uses_forwarded_proto_and_host(self):
+        request = self._request(
+            {
+                "host": "internal:8000",
+                "x-forwarded-proto": "https",
+                "x-forwarded-host": "web.example.com",
+            }
+        )
+        assert web.external_base(request) == "https://web.example.com"
+        assert web.callback_url(request) == "https://web.example.com/auth/callback"
+
+    def test_callback_is_https_behind_the_proxy(self):
+        """The exact bug seen in production: an http:// redirect_uri."""
+        request = self._request({"host": "web.example.com", "x-forwarded-proto": "https"})
+        assert web.callback_url(request).startswith("https://")
+
+    def test_falls_back_to_the_host_header(self):
+        request = self._request({"host": "127.0.0.1:8000"})
+        assert web.external_base(request) == "http://127.0.0.1:8000"
+
+    def test_takes_the_first_proto_when_chained(self):
+        request = self._request({"host": "web.example.com", "x-forwarded-proto": "https,http"})
+        assert web.external_base(request) == "https://web.example.com"
