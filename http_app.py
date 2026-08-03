@@ -26,8 +26,11 @@ from starlette.applications import Starlette
 from starlette.responses import JSONResponse, PlainTextResponse
 from starlette.routing import Route
 
+import api
 import oauth
 import server
+
+API_PREFIX = "/api/"
 
 log = logging.getLogger("context-vault.auth")
 
@@ -229,6 +232,10 @@ def build_app(
             await _metadata_response(scope, receive, send, path, oauth_config)
             return
 
+        if path.startswith(API_PREFIX):
+            await _api_response(scope, receive, send, path, token, oauth_config, verifier)
+            return
+
         if not path.startswith(PREFIX):
             await shell(scope, receive, send)
             return
@@ -268,6 +275,79 @@ def _bearer(scope) -> str | None:
                 return rest.strip()
             return None
     return None
+
+
+async def _api_authorized(scope, token, oauth_config, verifier) -> str | None:
+    """Auth for the read API. None if allowed, else a reason.
+
+    The API is cross-project, so there is no per-project resource URL to check
+    a JWT audience against. A JWT is therefore only accepted when a single
+    fixed audience is configured; otherwise the static token is the way in,
+    which is what the web service uses.
+    """
+    if token is None and oauth_config is None:
+        return None
+    presented = _bearer(scope)
+    if presented is None:
+        return "no bearer credential presented"
+    if token is not None and secrets.compare_digest(presented, token):
+        return None
+    if oauth_config is None or not oauth_config.audience:
+        return "invalid token"
+    try:
+        await verifier.verify(presented, oauth_config.audience)
+    except oauth.AuthError as exc:
+        return str(exc)
+    return None
+
+
+async def _api_response(scope, receive, send, path, token, oauth_config, verifier):
+    """Route and serve /api/... — read-only JSON over the hosted vaults."""
+    if scope.get("method", "GET") != "GET":
+        await JSONResponse({"error": "method not allowed"}, status_code=405)(
+            scope, receive, send
+        )
+        return
+
+    reason = await _api_authorized(scope, token, oauth_config, verifier)
+    if reason is not None:
+        log.warning("api: rejected path=%s reason=%s", path, reason)
+        await JSONResponse(
+            {"error": "unauthorized", "error_description": reason}, status_code=401
+        )(scope, receive, send)
+        return
+
+    rest = path[len(API_PREFIX) :].strip("/")
+    parts = rest.split("/") if rest else []
+
+    if parts == ["projects"]:
+        await JSONResponse(api.projects_payload())(scope, receive, send)
+        return
+
+    if len(parts) == 3 and parts[0] == "projects" and parts[2] == "decisions":
+        name = parts[1]
+        # Check existence first: server.connect() creates the file, so reading
+        # an unknown project would otherwise conjure an empty vault for every
+        # typo'd URL.
+        if not api.exists(name):
+            await JSONResponse({"error": "unknown project", "project": name}, status_code=404)(
+                scope, receive, send
+            )
+            return
+        query = scope.get("query_string", b"").decode()
+        include_retired = "include_retired=true" in query
+        await JSONResponse(api.decisions_payload(name, include_retired))(
+            scope, receive, send
+        )
+        return
+
+    await JSONResponse(
+        {
+            "error": "not found",
+            "routes": ["/api/projects", "/api/projects/{name}/decisions"],
+        },
+        status_code=404,
+    )(scope, receive, send)
 
 
 async def _metadata_response(scope, receive, send, path, oauth_config):

@@ -5,7 +5,7 @@ WORKDIR /app
 COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY server.py http_app.py oauth.py onboarding.py ./
+COPY server.py http_app.py oauth.py onboarding.py api.py ./
 
 # Vaults live on a mounted volume — without one, every redeploy wipes history.
 # No VOLUME instruction: Railway rejects it ("use Railway Volumes") and manages

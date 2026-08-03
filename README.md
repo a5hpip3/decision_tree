@@ -333,6 +333,41 @@ inherits the cluster of the decision it replaces.
 `cluster` and `source` appear in `list_decisions` output so an agent can see
 the labels already in use before inventing another.
 
+## Read API
+
+A Railway volume mounts to exactly one service, so the web front-end cannot
+open these SQLite files itself — it reads them through a JSON API on this
+service.
+
+| Route | Returns |
+|---|---|
+| `GET /api/projects` | every hosted project with per-status counts, cluster labels and last activity |
+| `GET /api/projects/{name}/decisions` | that project's decisions, plus the graph edges |
+
+Read-only by design: writes stay on the MCP tools, where the docstrings that
+shape how agents log live. Anything other than `GET` returns `405`.
+
+Edges are computed server-side, so the client never needs to know that a
+derivation and a reversal are stored in different columns:
+
+```json
+{"from": 7, "to": 3, "kind": "derives"}
+{"from": 9, "to": 7, "kind": "supersedes"}
+```
+
+Retired decisions are excluded unless `?include_retired=true`. An edge whose
+target was filtered out is dropped rather than left dangling.
+
+Only hosted vaults under `$CONTEXT_VAULT_HOME/remote/` are served — local
+vaults are keyed to somebody's laptop and never exposed. An unknown project
+name returns `404` **without creating a vault**, which matters because opening
+one would otherwise conjure an empty project for every typo'd URL.
+
+Auth reuses `CONTEXT_VAULT_TOKEN`. A JWT is accepted only when a single fixed
+`CONTEXT_VAULT_OAUTH_AUDIENCE` is configured, since these routes are
+cross-project and have no per-project resource URL to check an audience
+against.
+
 ## Tests
 
 ```bash
