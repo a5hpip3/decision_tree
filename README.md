@@ -487,6 +487,13 @@ are kept per project in `localStorage`, because an arrangement that vanished on
 the next filter change or reload would not be worth making. `RESET` appears
 once anything has moved and returns to the computed layout.
 
+Wheel zoom scales with the reported delta rather than applying a fixed step
+per event. A trackpad flick emits dozens of wheel events, so a constant factor
+compounded to nothing and the view bottomed out on the lightest touch. The
+factor is exponential, so scrolling back up exactly undoes scrolling down, and
+zoom is anchored on the pointer. Transitions are eased only for the buttons and
+`FIT`; wheel and drag track the input directly, where an animation reads as lag.
+
 During a drag the card and its edges are moved directly rather than
 re-rendering: a full repaint per mouse move would rebuild the DOM, and
 re-running the force simulation would fight the drag by pulling the node back.

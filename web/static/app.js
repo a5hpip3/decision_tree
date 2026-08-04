@@ -246,7 +246,7 @@ function fit() {
   state.scale = s;
   state.tx = cw > availW ? pad - b.x0 * s : pad + (availW - cw) / 2 - b.x0 * s;
   state.ty = ch > availH ? pad - b.y0 * s : pad + (availH - ch) / 2 - b.y0 * s;
-  applyTransform();
+  applyTransform(true);
 }
 
 function queueFit(tries = 0) {
@@ -260,9 +260,13 @@ function queueFit(tries = 0) {
   });
 }
 
-function applyTransform() {
+function applyTransform(animate = false) {
   const world = document.getElementById('world');
-  if (world) world.style.transform =
+  if (!world) return;
+  // Eased only for button and fit moves. Wheel and drag must track the input
+  // exactly; a transition there feels like lag, not smoothness.
+  world.style.transition = animate ? 'transform .18s ease' : 'none';
+  world.style.transform =
     `translate(${state.tx}px, ${state.ty}px) scale(${state.scale})`;
 }
 
@@ -508,8 +512,8 @@ function renderCanvas(colours) {
   canvas.appendChild(el('div', {
     style: 'position:absolute;left:14px;bottom:14px;display:flex;gap:6px;z-index:4',
   }, [
-    el('div', { class: 'zoom-btn', title: 'Zoom out', onClick: () => zoomBy(0.9) }, '−'),
-    el('div', { class: 'zoom-btn', title: 'Zoom in', onClick: () => zoomBy(1.1) }, '+'),
+    el('div', { class: 'zoom-btn', title: 'Zoom out', onClick: () => zoomBy(1 / 1.25) }, '−'),
+    el('div', { class: 'zoom-btn', title: 'Zoom in', onClick: () => zoomBy(1.25) }, '+'),
     el('div', { class: 'zoom-btn', title: 'Fit', style: 'width:auto;padding:0 8px;font-size:9px;letter-spacing:.1em', onClick: () => fit() }, 'FIT'),
     Object.keys(state.moved).length ? el('div', {
       class: 'zoom-btn',
@@ -615,16 +619,40 @@ function reveal(id) {
   }
 }
 
+const ZOOM_MIN = 0.25, ZOOM_MAX = 1.8;
+
+/** Zoom about a point, keeping whatever is under it fixed. */
+function zoomAt(factor, mx, my, animate = false) {
+  const next = Math.min(ZOOM_MAX, Math.max(ZOOM_MIN, state.scale * factor));
+  if (next === state.scale) return;
+  state.tx = mx - (mx - state.tx) * (next / state.scale);
+  state.ty = my - (my - state.ty) * (next / state.scale);
+  state.scale = next;
+  applyTransform(animate);
+}
+
 function zoomBy(factor) {
   const canvas = document.getElementById('canvas');
   if (!canvas) return;
   const rect = canvas.getBoundingClientRect();
-  const mx = rect.width / 2, my = rect.height / 2;
-  const next = Math.min(1.8, Math.max(0.25, state.scale * factor));
-  state.tx = mx - (mx - state.tx) * (next / state.scale);
-  state.ty = my - (my - state.ty) * (next / state.scale);
-  state.scale = next;
-  applyTransform();
+  zoomAt(factor, rect.width / 2, rect.height / 2, true);
+}
+
+/** How far one wheel event should zoom.
+ *
+ * A fixed step per event is what made this unusable: a single trackpad flick
+ * emits dozens of events, so a constant 0.9 compounded to nothing. Scaling by
+ * the reported delta makes a small movement small. The exponential keeps it
+ * symmetric — scrolling back up exactly undoes scrolling down.
+ */
+function wheelFactor(event) {
+  const unit = event.deltaMode === 1 ? 16 : event.deltaMode === 2 ? 400 : 1;
+  // Clamp so one oversized event (some mice report 100+ per notch) cannot
+  // swing the whole range at once.
+  const delta = Math.max(-60, Math.min(60, event.deltaY * unit));
+  // A trackpad pinch arrives as ctrl+wheel and is deliberately coarser.
+  const sensitivity = event.ctrlKey ? 0.005 : 0.0022;
+  return Math.exp(-delta * sensitivity);
 }
 
 /* ------------------------------------------------------------ interaction - */
@@ -698,12 +726,7 @@ function wireCanvas() {
   canvas.addEventListener('wheel', e => {
     e.preventDefault();
     const rect = canvas.getBoundingClientRect();
-    const mx = e.clientX - rect.left, my = e.clientY - rect.top;
-    const next = Math.min(1.8, Math.max(0.25, state.scale * (e.deltaY < 0 ? 1.1 : 0.9)));
-    state.tx = mx - (mx - state.tx) * (next / state.scale);
-    state.ty = my - (my - state.ty) * (next / state.scale);
-    state.scale = next;
-    applyTransform();
+    zoomAt(wheelFactor(e), e.clientX - rect.left, e.clientY - rect.top);
   }, { passive: false });
 
   canvas.addEventListener('mousedown', e => {
