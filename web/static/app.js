@@ -10,13 +10,45 @@
  * than no filter.
  */
 
-const PALETTE = ['#9E6046', '#3F7A5C', '#5A6FA8', '#90588C', '#7A7233', '#2C7C88'];
+/* Read from CSS so a theme change moves every colour at once — a second
+ * palette hardcoded here would drift the moment either side is edited. */
+/* Theme follows the system until the user says otherwise, and that choice
+ * sticks. Applied to <html> before first paint so the page never flashes the
+ * wrong background. */
+const THEME_KEY = 'decisiontree:theme';
+
+function preferredTheme() {
+  try {
+    const saved = localStorage.getItem(THEME_KEY);
+    if (saved === 'light' || saved === 'dark') return saved;
+  } catch { /* storage disabled */ }
+  return window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches
+    ? 'dark' : 'light';
+}
+
+function applyTheme(theme) {
+  document.documentElement.setAttribute('data-theme', theme);
+  state.theme = theme;
+}
+
+function toggleTheme() {
+  const next = state.theme === 'dark' ? 'light' : 'dark';
+  applyTheme(next);
+  try { localStorage.setItem(THEME_KEY, next); } catch { /* storage disabled */ }
+  // Orb, hull and edge colours are set as attributes at render time, so a
+  // repaint is what actually moves them; CSS alone only covers the chrome.
+  render();
+}
+
+const cssVar = name =>
+  getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+const palette = () => [0, 1, 2, 3, 4, 5].map(i => cssVar(`--cluster-${i}`));
 const UNCLUSTERED = 'Unclustered';
 
 const STATUS = {
-  active:     { label: 'Active',     color: '#3F7A5C' },
-  superseded: { label: 'Superseded', color: '#A9A198' },
-  retired:    { label: 'Retired',    color: '#B5ADA3' },
+  active:     { label: 'Active',     color: 'var(--ok)' },
+  superseded: { label: 'Superseded', color: 'var(--muted-2)' },
+  retired:    { label: 'Retired',    color: 'var(--muted-3)' },
 };
 
 const SOURCE_LABEL = { chat: 'CHAT', code: 'CODE', pr: 'PR', doc: 'DOC' };
@@ -31,6 +63,7 @@ const state = {
   moved: {},          // id -> {x, y}: positions the user dragged, in world space
   tx: 40, ty: 20, scale: 0.82,
   loading: true, error: null, user: null,
+  theme: 'light',
 };
 
 /* ---------------------------------------------------------------- data --- */
@@ -104,7 +137,8 @@ const clusterOf = d => d.cluster || UNCLUSTERED;
 function clusterColours() {
   const names = [...new Set(state.decisions.map(clusterOf))].sort();
   const map = {};
-  names.forEach((name, i) => { map[name] = PALETTE[i % PALETTE.length]; });
+  const colours = palette();
+  names.forEach((name, i) => { map[name] = colours[i % colours.length]; });
   return map;
 }
 
@@ -344,7 +378,7 @@ function renderRail(colours) {
     el('div', { class: 'kicker' }, 'Context ledger'),
   ]);
 
-  const search = el('div', { style: 'padding:14px 16px 12px;border-bottom:1px solid #E2DACD' }, [
+  const search = el('div', { style: 'padding:14px 16px 12px;border-bottom:1px solid var(--line)' }, [
     el('input', {
       class: 'search', placeholder: 'Search decisions…', value: state.query,
       onInput: e => { state.query = e.target.value; layoutCache.key = null; render(); },
@@ -352,15 +386,15 @@ function renderRail(colours) {
   ]);
 
   const projects = el('div', {
-    style: 'padding:6px 10px 14px;display:flex;flex-direction:column;gap:2px;border-bottom:1px solid #E2DACD',
+    style: 'padding:6px 10px 14px;display:flex;flex-direction:column;gap:2px;border-bottom:1px solid var(--line)',
   }, state.projects.map(p => {
     const on = p.name === state.project;
     return el('div', {
       class: 'proj',
-      style: `background:${on ? '#F1E9DC' : 'transparent'};border-left-color:${on ? '#A85C3A' : 'transparent'}`,
+      style: `background:${on ? 'var(--selected)' : 'transparent'};border-left-color:${on ? 'var(--accent)' : 'transparent'}`,
       onClick: () => loadProject(p.name),
     }, [
-      el('span', { class: 'proj-name', style: `color:${on ? '#1C1917' : '#4A443D'}` }, p.name),
+      el('span', { class: 'proj-name', style: `color:${on ? 'var(--ink)' : 'var(--ink-2)'}` }, p.name),
       el('span', { class: 'proj-count' }, String(p.active)),
     ]);
   }));
@@ -373,12 +407,12 @@ function renderRail(colours) {
       const off = state.statusOff[k];
       return el('div', {
         class: 'chip',
-        style: `border:1px solid ${off ? '#E7E0D4' : '#DED5C6'};background:${off ? 'transparent' : '#FFFDF9'};color:${off ? '#B5ADA3' : '#4A443D'}`,
+        style: `border:1px solid ${off ? 'var(--line-soft)' : 'var(--line-strong)'};background:${off ? 'transparent' : 'var(--surface)'};color:${off ? 'var(--muted-3)' : 'var(--ink-2)'}`,
         onClick: () => { state.statusOff[k] = !off; layoutCache.key = null; render(); },
       }, [
         el('span', { class: 'dot', style: `background:${STATUS[k].color}` }),
         STATUS[k].label,
-        el('span', { style: 'color:#A9A198;font-size:9px' }, String(statusCounts[k])),
+        el('span', { style: 'color:var(--muted-2);font-size:9px' }, String(statusCounts[k])),
       ]);
     })));
 
@@ -390,10 +424,10 @@ function renderRail(colours) {
         const off = state.sourceOff[s];
         return el('div', {
           class: 'chip',
-          style: `border:1px solid ${off ? '#E7E0D4' : '#DED5C6'};background:${off ? 'transparent' : '#FFFDF9'};color:${off ? '#B5ADA3' : '#4A443D'};letter-spacing:.1em`,
+          style: `border:1px solid ${off ? 'var(--line-soft)' : 'var(--line-strong)'};background:${off ? 'transparent' : 'var(--surface)'};color:${off ? 'var(--muted-3)' : 'var(--ink-2)'};letter-spacing:.1em`,
           onClick: () => { state.sourceOff[s] = !off; layoutCache.key = null; render(); },
         }, [SOURCE_LABEL[s] || s.toUpperCase(),
-            el('span', { style: 'color:#A9A198;font-size:9px' }, String(sourceCounts[s] || 0))]);
+            el('span', { style: 'color:var(--muted-2);font-size:9px' }, String(sourceCounts[s] || 0))]);
       })));
   }
 
@@ -408,27 +442,32 @@ function renderRail(colours) {
           onClick: () => { state.clusterOff[name] = !off; layoutCache.key = null; render(); },
         }, [
           el('span', { class: 'swatch', style: `background:${colours[name]}` }),
-          el('span', { style: 'flex:1;font-size:11px;color:#4A443D' }, name),
-          el('span', { style: 'font-size:9.5px;color:#A9A198' }, String(clusterCounts[name])),
+          el('span', { style: 'flex:1;font-size:11px;color:var(--ink-2)' }, name),
+          el('span', { style: 'font-size:9.5px;color:var(--muted-2)' }, String(clusterCounts[name])),
         ]);
       })));
   }
 
   const project = state.projects.find(p => p.name === state.project);
   const foot = el('div', {
-    style: 'padding:11px 16px 9px;border-top:1px solid #E2DACD;font-size:9.5px;color:#9A9288;line-height:1.6',
+    style: 'padding:11px 16px 9px;border-top:1px solid var(--line);font-size:9.5px;color:var(--muted);line-height:1.6',
   }, [
     `${shown.length} of ${state.decisions.length} shown`,
     el('br'),
-    el('span', { style: 'color:#B5ADA3' },
+    el('span', { style: 'color:var(--muted-3)' },
       project && project.last_activity ? `Last logged ${shortDate(project.last_activity)}` : ''),
   ]);
 
   const account = el('div', {
-    style: 'padding:10px 16px 14px;border-top:1px solid #E2DACD;display:flex;align-items:center;gap:8px',
+    style: 'padding:10px 16px 14px;border-top:1px solid var(--line);display:flex;align-items:center;gap:8px',
   }, [
-    el('span', { style: 'flex:1;font-size:10px;color:#9A9288;overflow:hidden;text-overflow:ellipsis' },
+    el('span', { style: 'flex:1;font-size:10px;color:var(--muted);overflow:hidden;text-overflow:ellipsis' },
       state.user ? state.user.email || '' : ''),
+    el('span', {
+      class: 'theme-toggle',
+      title: state.theme === 'dark' ? 'Switch to light' : 'Switch to dark',
+      onClick: toggleTheme,
+    }, state.theme === 'dark' ? '☾' : '☀'),
     el('a', { class: 'link', href: '/logout', style: 'font-size:10px' }, 'Sign out'),
   ]);
 
@@ -545,7 +584,7 @@ function showPop(decision, colour, canvas) {
       decision.cluster
         ? el('span', { style: `color:${colour};letter-spacing:.13em` }, decision.cluster.toUpperCase())
         : null,
-      el('span', { style: 'margin-left:auto;color:#B0A89E' }, shortDate(decision.created_at)),
+      el('span', { style: 'margin-left:auto;color:var(--muted-2)' }, shortDate(decision.created_at)),
     ]),
     el('div', { class: 'pop-title' }, decision.summary),
   ]);
@@ -569,7 +608,7 @@ function renderCanvas(colours) {
   const list = visible();
   const canvas = el('div', {
     id: 'canvas',
-    style: 'position:relative;overflow:hidden;cursor:grab;background:#F4F0E8',
+    style: 'position:relative;overflow:hidden;cursor:grab;background:var(--canvas)',
   });
 
   if (state.loading || state.error || !list.length) {
@@ -582,7 +621,7 @@ function renderCanvas(colours) {
           : 'No decisions in this project yet.';
     canvas.appendChild(el('div', {
       style: 'position:absolute;inset:0;display:flex;align-items:center;justify-content:center;'
-           + `font-size:11px;color:${state.error ? '#A85C3A' : '#A0988E'}`,
+           + `font-size:11px;color:${state.error ? 'var(--accent)' : 'var(--muted)'}`,
     }, message));
     return canvas;
   }
@@ -609,8 +648,9 @@ function renderCanvas(colours) {
     if (!members.length) return;
     const path = svgEl('path', {
       d: hullPath(members, 54),
-      fill: colours[name], 'fill-opacity': 0.07,
-      stroke: colours[name], 'stroke-opacity': 0.22, 'stroke-width': 1,
+      fill: colours[name], 'fill-opacity': cssVar('--hull-fill') || 0.07,
+      stroke: colours[name], 'stroke-opacity': cssVar('--hull-stroke') || 0.22,
+      'stroke-width': 1,
     });
     refs.hulls[name] = { el: path, name };
     svg.appendChild(path);
@@ -620,7 +660,7 @@ function renderCanvas(colours) {
   refs.lines = [];
   links.filter(l => l.kind).forEach(l => {
     const line = svgEl('line', {
-      stroke: l.kind === 'supersedes' ? '#C0AE93' : '#B9AC97',
+      stroke: l.kind === 'supersedes' ? 'var(--edge-strong)' : 'var(--edge)',
       'stroke-width': l.kind === 'derives' ? 1.4 : 1,
       'stroke-opacity': 0.85,
     });
@@ -661,20 +701,20 @@ function renderCanvas(colours) {
       const p = nodePos(d.id, pos);
       const card = el('div', {
         class: 'node' + (chosen ? ' selected' : ''),
-        style: `left:${p.x}px;top:${p.y}px;border:1px solid ${chosen ? '#A85C3A' : '#E2DACD'};`
+        style: `left:${p.x}px;top:${p.y}px;border:1px solid ${chosen ? 'var(--accent)' : 'var(--line)'};`
              + `opacity:${dim ? 0.55 : 1}`,
       }, [
         el('div', { class: 'node-meta' }, [
           d.source ? el('span', { class: 'tag' }, SOURCE_LABEL[d.source] || d.source.toUpperCase()) : null,
-          el('span', { class: 'dot', style: `background:${(STATUS[d.status] || {}).color || '#A9A198'}` }),
-          el('span', { style: 'font-size:8.5px;letter-spacing:.08em;color:#A9A198;text-transform:uppercase' },
+          el('span', { class: 'dot', style: `background:${(STATUS[d.status] || {}).color || 'var(--muted-2)'}` }),
+          el('span', { style: 'font-size:8.5px;letter-spacing:.08em;color:var(--muted-2);text-transform:uppercase' },
             (STATUS[d.status] || {}).label || d.status),
-          el('span', { style: 'margin-left:auto;font-size:9px;color:#B0A89E' }, shortDate(d.created_at)),
+          el('span', { style: 'margin-left:auto;font-size:9px;color:var(--muted-2)' }, shortDate(d.created_at)),
         ]),
         el('div', { class: 'node-title' }, d.summary),
         d.cluster ? el('div', { class: 'node-cluster' }, [
           el('span', { style: `width:5px;height:5px;background:${colour}` }),
-          el('span', { style: 'font-size:8.5px;letter-spacing:.13em;text-transform:uppercase;color:#A0988E' }, d.cluster),
+          el('span', { style: 'font-size:8.5px;letter-spacing:.13em;text-transform:uppercase;color:var(--muted)' }, d.cluster),
         ]) : null,
       ]);
       card.addEventListener('mousedown', e => startNodeDrag(e, d, nodePos(d.id, pos)));
@@ -730,7 +770,7 @@ function renderCanvas(colours) {
 function relatedRow(label, ids) {
   if (!ids.length) return null;
   return el('div', { style: 'margin-bottom:8px' }, [
-    el('span', { style: 'font-size:10px;color:#A0988E' }, label + ' '),
+    el('span', { style: 'font-size:10px;color:var(--muted)' }, label + ' '),
     ...ids.map(id => el('span', {
       class: 'link',
       onClick: () => {
@@ -749,11 +789,11 @@ function renderPanel(colours) {
   const rows = [
     el('div', { style: 'display:flex;align-items:center;gap:8px;margin-bottom:14px' }, [
       el('span', { class: 'dot', style: `background:${(STATUS[d.status] || {}).color}` }),
-      el('span', { style: 'font-size:9px;letter-spacing:.12em;text-transform:uppercase;color:#A9A198' },
+      el('span', { style: 'font-size:9px;letter-spacing:.12em;text-transform:uppercase;color:var(--muted-2)' },
         (STATUS[d.status] || {}).label || d.status),
-      el('span', { style: 'margin-left:auto;font-size:10px;color:#B0A89E' }, shortDate(d.created_at)),
+      el('span', { style: 'margin-left:auto;font-size:10px;color:var(--muted-2)' }, shortDate(d.created_at)),
       el('span', {
-        style: 'cursor:pointer;font-size:15px;color:#A0988E;line-height:1',
+        style: 'cursor:pointer;font-size:15px;color:var(--muted);line-height:1',
         onClick: () => { state.panelOpen = false; state.selected = null; render(); },
       }, '×'),
     ]),
@@ -768,7 +808,7 @@ function renderPanel(colours) {
   ];
 
   if (d.ref) rows.push(el('div', {
-    style: 'font-size:9.5px;color:#A0988E;word-break:break-all;margin-bottom:18px',
+    style: 'font-size:9.5px;color:var(--muted);word-break:break-all;margin-bottom:18px',
   }, d.ref));
 
   const related = [
@@ -787,7 +827,7 @@ function renderPanel(colours) {
   if (d.author) meta.push(`Logged by ${d.author}`);
   if (meta.length) {
     rows.push(el('div', {
-      style: 'margin-top:16px;padding-top:12px;border-top:1px solid #E7E0D4;font-size:10px;color:#A0988E;line-height:1.7',
+      style: 'margin-top:16px;padding-top:12px;border-top:1px solid var(--line-soft);font-size:10px;color:var(--muted);line-height:1.7',
     }, meta.join(' · ')));
   }
 
@@ -989,6 +1029,17 @@ function render() {
   app.replaceChildren(renderRail(colours), renderCanvas(colours));
   applyTransform();
   wireCanvas();
+}
+
+applyTheme(preferredTheme());
+
+// Follow the system if the user has never chosen explicitly.
+if (window.matchMedia) {
+  window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', e => {
+    let chosen = null;
+    try { chosen = localStorage.getItem(THEME_KEY); } catch { /* ignore */ }
+    if (!chosen) { applyTheme(e.matches ? 'dark' : 'light'); render(); }
+  });
 }
 
 (async () => {

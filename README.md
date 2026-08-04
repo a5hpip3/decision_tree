@@ -487,6 +487,23 @@ are kept per project in `localStorage`, because an arrangement that vanished on
 the next filter change or reload would not be worth making. `RESET` appears
 once anything has moved and returns to the computed layout.
 
+### Themes
+
+Light and dark, toggled from the rail footer. The choice is remembered; with no
+choice made it follows `prefers-color-scheme`, and the theme is applied by an
+inline script before first paint so a dark-mode machine never flashes a light
+background.
+
+Every colour is a CSS custom property, including the six cluster colours, which
+`app.js` reads back with `getComputedStyle`. Orb, hull and edge colours are set
+as attributes at render time, so switching theme triggers a repaint rather than
+relying on CSS alone — and a second palette hardcoded in JS would drift the
+moment either side was edited.
+
+Dark is warm rather than neutral grey: the paper character is the identity, and
+against a cold grey the terracotta accent reads as an error state. Hull tints go
+from 7% to 13% because a 7% fill disappears against near-black.
+
 Decisions render as orbs, not cards. At 28 decisions the cards covered about
 55% of the canvas, burying the edges and cluster regions the layout exists to
 show. An orb is roughly a fortieth of that area, sized by how many decisions it
