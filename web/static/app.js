@@ -1,17 +1,18 @@
 /* DecisionTree — Context Graph.
  *
- * The force layout in layout() is ported from the design's graph() and kept
+ * The force constants are ported from the design's graph() and kept
  * deliberately faithful: the same virtual root/cluster hierarchy, the same
- * spring weights and ideal lengths, the same 460 cooling iterations. Change
- * those numbers and it stops looking like the design.
+ * spring weights and ideal lengths. Change those numbers and it stops looking
+ * like the design — which is why the graph was grown by scaling the solved
+ * coordinates (WORLD) rather than by loosening the forces. What did change is
+ * that they run a frame at a time against a decaying alpha instead of 460
+ * iterations up front, so the springs are still live once the graph settles.
  *
  * Fields the vault does not carry yet (cluster, source, author, ref) are
  * hidden rather than faked — a filter over data that is always null is worse
  * than no filter.
  */
 
-/* Read from CSS so a theme change moves every colour at once — a second
- * palette hardcoded here would drift the moment either side is edited. */
 /* Theme follows the system until the user says otherwise, and that choice
  * sticks. Applied to <html> before first paint so the page never flashes the
  * wrong background. */
@@ -40,6 +41,8 @@ function toggleTheme() {
   render();
 }
 
+/* Read from CSS so a theme change moves every colour at once — a second
+ * palette hardcoded here would drift the moment either side is edited. */
 const cssVar = name =>
   getComputedStyle(document.documentElement).getPropertyValue(name).trim();
 const palette = () => [0, 1, 2, 3, 4, 5].map(i => cssVar(`--cluster-${i}`));
@@ -60,7 +63,9 @@ const state = {
   clusters: [], sources: [],
   query: '', statusOff: {}, sourceOff: {}, clusterOff: {},
   selected: null, panelOpen: false,
-  moved: {},          // id -> {x, y}: positions the user dragged, in world space
+  layout: {},         // id -> {x, y}: where the graph last settled
+  pinned: {},         // id -> true: nodes the user placed, which the sim leaves alone
+  hovered: null,      // decision id under the cursor, for neighbourhood dimming
   tx: 40, ty: 20, scale: 0.82,
   loading: true, error: null, user: null,
   theme: 'light',
@@ -91,44 +96,51 @@ async function loadProject(name) {
   state.sources = data.sources || [];
   state.selected = null; state.panelOpen = false;
   state.statusOff = {}; state.sourceOff = {}; state.clusterOff = {};
-  state.moved = loadMoved(name);
+  const restored = loadLayout(name);
+  state.layout = restored.positions;
+  state.pinned = restored.pinned;
   state.loading = false;
-  layoutCache.key = null;
+  sim.key = null;
   render();
   queueFit();
 }
 
 /* ---------------------------------------------------------- arrangement --- */
 
-/* A dragged arrangement is the user's own work — losing it on a filter change
- * or a page reload would make dragging pointless, so it is kept per project. */
+/* Where the graph settled is the user's own view of the project, so it is kept
+ * per project. Nodes the user dragged are pinned and the simulation leaves
+ * them alone; everything else is free to re-settle around them. */
 
-const movedKey = name => `decisiontree:moved:${name}`;
+const layoutKeyFor = name => `decisiontree:layout:${name}`;
 
-function loadMoved(name) {
+function loadLayout(name) {
   try {
-    return JSON.parse(localStorage.getItem(movedKey(name)) || '{}');
+    const raw = JSON.parse(localStorage.getItem(layoutKeyFor(name)) || '{}');
+    return { positions: raw.positions || {}, pinned: raw.pinned || {} };
   } catch {
-    return {};
+    return { positions: {}, pinned: {} };
   }
 }
 
-function saveMoved() {
+function saveLayout() {
   if (!state.project) return;
+  const positions = {};
+  sim.nodes.forEach(n => { positions[n.id] = { x: Math.round(n.x), y: Math.round(n.y) }; });
   try {
-    if (Object.keys(state.moved).length) {
-      localStorage.setItem(movedKey(state.project), JSON.stringify(state.moved));
-    } else {
-      localStorage.removeItem(movedKey(state.project));
-    }
-  } catch {
-    /* storage disabled or full — the arrangement just won't outlive the tab */
-  }
+    localStorage.setItem(layoutKeyFor(state.project),
+      JSON.stringify({ positions, pinned: state.pinned }));
+  } catch { /* storage disabled — the arrangement just won't outlive the tab */ }
 }
 
-/** Where a node actually sits: the dragged position if there is one, else the
- *  position the force layout computed. */
-const nodePos = (id, pos) => state.moved[id] || pos['d:' + id];
+function clearLayout() {
+  state.layout = {}; state.pinned = {};
+  try { localStorage.removeItem(layoutKeyFor(state.project)); } catch { /* ignore */ }
+  sim.key = null;
+  render();
+  reheat(1);
+}
+
+const centreOf = id => sim.index['d:' + id];
 
 /* -------------------------------------------------------------- helpers --- */
 
@@ -161,87 +173,165 @@ function visible() {
   });
 }
 
-/* --------------------------------------------------------------- layout --- */
+/* ------------------------------------------------------------ simulation --- */
 
-const layoutCache = { key: null, value: null };
+/* The forces are the ones the batch layout used — the shape they produce is
+ * the shape that was signed off. What changed is that they run every frame
+ * instead of 460 times up front: a graph that is still solving reads as alive,
+ * and dragging a node can pull its neighbours because the springs are live
+ * rather than already resolved.
+ */
+/* The batch layout solved with these constants and then scaled the solved
+ * result to fit 1250x860. Growing the graph by changing the constants changed
+ * its shape too — weakening the centring force strung the clusters out into a
+ * diagonal chain. So the forces are exactly the originals, and the coordinates
+ * they produce are multiplied at render time, which is what the batch version
+ * effectively did. The simulation thinks in solved units; the DOM is in world
+ * units; WORLD is the only bridge between them.
+ */
+const WORLD = 2.2;
+const FORCE = {
+  repel: 44 * 44,     // K² from the original layout
+  cutoff2: 25600,     // beyond ~160 units repulsion is not worth computing
+  spring: 0.045,
+  centre: 0.006,
+  damping: 0.72,
+  decay: 0.028,       // ~3s to settle from cold at 60fps
+  floor: 0.004,       // below this the graph is at rest and the loop stops
+};
 
-function layout(list) {
-  const key = state.project + '|' + list.map(d => d.id).join(',');
-  if (layoutCache.key === key) return layoutCache.value;
+const sim = {
+  key: null, nodes: [], index: {}, links: [], clusters: [],
+  alpha: 0, frame: null,
+  // A graph that is still solving grows well past the frame it was fitted to,
+  // so a cold one is re-fitted when it comes to rest. Any pan, zoom or drag
+  // hands the view to the user and cancels that — re-framing under someone who
+  // has just positioned the view is worse than an imperfect fit.
+  fitOnRest: false,
+};
 
+const layoutKey = list => state.project + '|' + list.map(d => d.id).join(',');
+
+/** Deterministic starting spread, so a cold graph never begins degenerate. */
+function seedPosition(i) {
+  const angle = i * 2.399963, radius = 40 + 70 * Math.sqrt(i);
+  return { x: Math.cos(angle) * radius, y: Math.sin(angle) * radius };
+}
+
+function buildSim(list) {
   const clusters = [...new Set(list.map(clusterOf))].sort();
   const ids = ['__root'].concat(clusters.map(c => 'cl:' + c), list.map(d => 'd:' + d.id));
-  const idx = {}; ids.forEach((id, i) => { idx[id] = i; });
+
+  const saved = state.layout || {};
+  const previous = sim.index;
+  const nodes = ids.map((id, i) => {
+    // Carry a node across a filter change so the graph glides to its new shape
+    // rather than restarting; fall back to a saved position, then to the seed.
+    // The root is a layout anchor rather than a datum, and it is nailed to the
+    // origin. Left free it drifts, and since the centring force pulls towards
+    // the origin regardless, the clusters end up orbiting a centre that is not
+    // where they are being pulled — which is what strung them into a diagonal.
+    if (id === '__root') return { id, x: 0, y: 0, vx: 0, vy: 0, pinned: true };
+    const from = previous[id] || saved[id] || seedPosition(i);
+    return {
+      id, x: from.x, y: from.y, vx: 0, vy: 0,
+      pinned: !!(state.pinned && state.pinned[id]),
+    };
+  });
+
+  const index = {};
+  nodes.forEach(n => { index[n.id] = n; });
 
   const links = [];
-  clusters.forEach(c => links.push([idx['__root'], idx['cl:' + c], 1.3, 430]));
-  list.forEach(d => links.push([idx['cl:' + clusterOf(d)], idx['d:' + d.id], 4.0, 50]));
+  clusters.forEach(c => links.push({ a: '__root', b: 'cl:' + c, w: 1.3, ideal: 430 }));
+  list.forEach(d => links.push({ a: 'cl:' + clusterOf(d), b: 'd:' + d.id, w: 4.0, ideal: 50 }));
 
   const present = new Set(list.map(d => d.id));
   list.forEach(d => {
     if (d.derives_from && present.has(d.derives_from)) {
-      links.push([idx['d:' + d.derives_from], idx['d:' + d.id], 1.5, 58, 'derives']);
+      links.push({ a: 'd:' + d.derives_from, b: 'd:' + d.id, w: 1.5, ideal: 58, kind: 'derives' });
     }
   });
   state.edges.filter(e => e.kind === 'supersedes').forEach(e => {
     if (present.has(e.from) && present.has(e.to)) {
-      links.push([idx['d:' + e.to], idx['d:' + e.from], 0.4, 120, 'supersedes']);
+      links.push({ a: 'd:' + e.to, b: 'd:' + e.from, w: 0.4, ideal: 120, kind: 'supersedes' });
     }
   });
 
-  const n = ids.length, K = 44;
-  const px = new Float64Array(n), py = new Float64Array(n);
-  for (let i = 0; i < n; i++) {
-    const a = i * 2.399963, r = 40 + 70 * Math.sqrt(i);
-    px[i] = Math.cos(a) * r; py[i] = Math.sin(a) * r;
-  }
-  px[0] = 0; py[0] = 0;
+  const hadPositions = ids.every(id => previous[id] || saved[id]);
+  Object.assign(sim, {
+    key: layoutKey(list), nodes, index, links, clusters,
+    // A graph restored from saved positions is already at rest; a fresh one
+    // should be seen to arrive.
+    alpha: hadPositions ? 0 : 1,
+    fitOnRest: sim.fitOnRest || !hadPositions,
+  });
+}
 
-  const dx = new Float64Array(n), dy = new Float64Array(n);
-  for (let it = 0; it < 460; it++) {
-    const t = 70 * (1 - it / 460) + 1.5;
-    dx.fill(0); dy.fill(0);
-    for (let i = 0; i < n; i++) for (let j = i + 1; j < n; j++) {
-      let ax = px[i] - px[j], ay = py[i] - py[j];
-      let d2 = ax * ax + ay * ay;
-      if (d2 < 1) { d2 = 1; ax = (i % 3) - 1 || 0.7; ay = (j % 3) - 1 || 0.5; }
-      if (d2 > 25600) continue;
-      const dist = Math.sqrt(d2), f = (K * K) / dist / dist;
-      dx[i] += ax * f; dy[i] += ay * f; dx[j] -= ax * f; dy[j] -= ay * f;
+function ensureSim(list) {
+  if (sim.key !== layoutKey(list)) buildSim(list);
+  return sim;
+}
+
+function stepSim() {
+  const nodes = sim.nodes;
+  sim.alpha += (0 - sim.alpha) * FORCE.decay;
+  const a = sim.alpha;
+
+  for (let i = 0; i < nodes.length; i++) {
+    for (let j = i + 1; j < nodes.length; j++) {
+      const p = nodes[i], q = nodes[j];
+      let dx = p.x - q.x, dy = p.y - q.y;
+      let d2 = dx * dx + dy * dy;
+      if (d2 > FORCE.cutoff2) continue;
+      if (d2 < 1) { d2 = 1; dx = (i % 3) - 1 || 0.7; dy = (j % 3) - 1 || 0.5; }
+      const d = Math.sqrt(d2);
+      const f = (FORCE.repel / d2) * a;
+      const fx = (dx / d) * f, fy = (dy / d) * f;
+      p.vx += fx; p.vy += fy; q.vx -= fx; q.vy -= fy;
     }
-    links.forEach(l => {
-      const i = l[0], j = l[1], w = l[2], ideal = l[3];
-      const ax = px[j] - px[i], ay = py[j] - py[i];
-      const dist = Math.max(1, Math.sqrt(ax * ax + ay * ay));
-      const f = ((dist - ideal) / dist) * 0.12 * w;
-      dx[i] += ax * f; dy[i] += ay * f; dx[j] -= ax * f; dy[j] -= ay * f;
-    });
-    for (let i = 0; i < n; i++) {
-      dx[i] -= px[i] * 0.006; dy[i] -= py[i] * 0.006;
-      const m = Math.sqrt(dx[i] * dx[i] + dy[i] * dy[i]) || 1;
-      const s = Math.min(m, t) / m;
-      px[i] += dx[i] * s; py[i] += dy[i] * s;
+  }
+
+  for (const l of sim.links) {
+    const p = sim.index[l.a], q = sim.index[l.b];
+    if (!p || !q) continue;
+    const dx = q.x - p.x, dy = q.y - p.y;
+    const d = Math.max(1, Math.hypot(dx, dy));
+    const f = (d - l.ideal) * FORCE.spring * l.w * a;
+    const fx = (dx / d) * f, fy = (dy / d) * f;
+    p.vx += fx; p.vy += fy; q.vx -= fx; q.vy -= fy;
+  }
+
+  for (const p of nodes) {
+    p.vx -= p.x * FORCE.centre * a;
+    p.vy -= p.y * FORCE.centre * a;
+    if (p.pinned) { p.vx = 0; p.vy = 0; continue; }
+    p.vx *= FORCE.damping; p.vy *= FORCE.damping;
+    p.x += p.vx; p.y += p.vy;
+  }
+}
+
+function runSim() {
+  if (sim.frame !== null) return;
+  const tick = () => {
+    stepSim();
+    paint();
+    if (sim.alpha > FORCE.floor) {
+      sim.frame = requestAnimationFrame(tick);
+    } else {
+      sim.frame = null;
+      saveLayout();      // at rest: remember where everything landed
+      if (sim.fitOnRest) { sim.fitOnRest = false; fit(); }
     }
-    px[0] *= 0.9; py[0] *= 0.9;
-  }
-
-  let minx = Infinity, miny = Infinity, maxx = -Infinity, maxy = -Infinity;
-  for (let i = 0; i < n; i++) {
-    if (px[i] < minx) minx = px[i];
-    if (py[i] < miny) miny = py[i];
-    if (px[i] > maxx) maxx = px[i];
-    if (py[i] > maxy) maxy = py[i];
-  }
-  const sc = Math.min(1250 / Math.max(1, maxx - minx), 860 / Math.max(1, maxy - miny));
-  const pos = {};
-  ids.forEach((id, i) => { pos[id] = { x: (px[i] - minx) * sc + 170, y: (py[i] - miny) * sc + 130 }; });
-
-  layoutCache.key = key;
-  layoutCache.value = {
-    pos, clusters,
-    links: links.map(l => ({ a: ids[l[0]], b: ids[l[1]], kind: l[4] })),
   };
-  return layoutCache.value;
+  sim.frame = requestAnimationFrame(tick);
+}
+
+/** Warm the simulation back up. Any interaction should make it re-settle
+ *  rather than snap, which is the whole difference in feel. */
+function reheat(target = 0.35) {
+  sim.alpha = Math.max(sim.alpha, target);
+  runSim();
 }
 
 /** The bounding box of what is actually on screen, in world units.
@@ -252,36 +342,37 @@ function layout(list) {
  * of those. World children are positioned in world units and scaled by the
  * transform, so offset* and SVG getBBox() are already the coordinates we want.
  */
-function measuredBBox() {
-  const world = document.getElementById('world');
-  if (!world) return null;
+/* The bounding box of the graph, derived from the simulation rather than from
+ * the DOM.
+ *
+ * Measuring the DOM made the fit depend on the detail tier: labels are real
+ * elements, so they widened the box, which lowered the scale, which dropped
+ * the tier, which removed the labels — and the next fit read the narrower box
+ * and put them back. A graph whose natural fit sat near a threshold flipped
+ * between two scales indefinitely. The simulation *is* the graph; labels are
+ * annotations hung off it and are allowed to overflow.
+ */
+const NODE_MARGIN = 46;   // clears the largest orb and the largest cluster ring
+
+function layoutBBox() {
   let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
-  const cover = (x, y, w, h) => {
-    if (!isFinite(x) || !isFinite(y) || (!w && !h)) return;
+  for (const n of sim.nodes) {
+    if (n.id === '__root') continue;          // no visual form, so not in frame
+    const x = n.x * WORLD, y = n.y * WORLD;
+    if (!isFinite(x) || !isFinite(y)) continue;
     x0 = Math.min(x0, x); y0 = Math.min(y0, y);
-    x1 = Math.max(x1, x + w); y1 = Math.max(y1, y + h);
-  };
-  for (const child of world.children) {
-    if (child.tagName.toLowerCase() === 'svg') {
-      for (const shape of child.children) {
-        try {
-          const b = shape.getBBox();
-          cover(b.x, b.y, b.width, b.height);
-        } catch { /* not rendered yet */ }
-      }
-    } else {
-      cover(child.offsetLeft, child.offsetTop, child.offsetWidth, child.offsetHeight);
-    }
+    x1 = Math.max(x1, x); y1 = Math.max(y1, y);
   }
   if (x0 === Infinity) return null;
-  return { x0, y0, x1, y1 };
+  return { x0: x0 - NODE_MARGIN, y0: y0 - NODE_MARGIN,
+           x1: x1 + NODE_MARGIN, y1: y1 + NODE_MARGIN };
 }
 
-function fit(depth = 0) {
+function fit() {
   const canvas = document.getElementById('canvas');
   const list = visible();
   if (!canvas || !list.length) return;
-  const b = measuredBBox();
+  const b = layoutBBox();
   if (!b) return;
   const tierBefore = tierFor(state.scale);
   const rect = canvas.getBoundingClientRect(), pad = 40;
@@ -295,25 +386,22 @@ function fit(depth = 0) {
   state.tx = cw > availW ? pad - b.x0 * s : pad + (availW - cw) / 2 - b.x0 * s;
   state.ty = ch > availH ? pad - b.y0 * s : pad + (availH - ch) / 2 - b.y0 * s;
   applyTransform(true);
-  // Fitting can cross a detail threshold, which changes what is drawn and so
-  // what needs fitting. Re-measure once; the second pass always converges
-  // because the tier is already correct for the new scale.
-  if (depth === 0 && tierFor(state.scale) !== tierBefore) {
-    render();
-    requestAnimationFrame(() => fit(1));
-  }
+  // Fitting can cross a detail threshold, which changes what is drawn. It no
+  // longer changes what is measured, so redrawing is all that is needed — no
+  // second fit, and no scale to converge on.
+  if (tierFor(state.scale) !== tierBefore) render();
 }
 
 function queueFit(tries = 0) {
-  // Two frames: the first commits the DOM render() just produced, the second
-  // is where it can actually be measured. Waiting on measuredBBox() as well
-  // covers a canvas that exists but has not laid out its children yet —
-  // fitting against nothing silently leaves the view unfitted.
+  // The box comes from the simulation, so the only thing worth waiting for is
+  // the canvas having a width to fit into. Two frames still, because a canvas
+  // that render() has only just produced has not been laid out yet, and
+  // fitting into a zero-width box silently leaves the view unfitted.
   requestAnimationFrame(() => requestAnimationFrame(() => {
     const canvas = document.getElementById('canvas');
     const ready = canvas
       && canvas.getBoundingClientRect().width >= 40
-      && measuredBBox();
+      && sim.nodes.length;
     if (!ready) {
       if (tries < 20) queueFit(tries + 1);
       return;
@@ -381,7 +469,7 @@ function renderRail(colours) {
   const search = el('div', { style: 'padding:14px 16px 12px;border-bottom:1px solid var(--line)' }, [
     el('input', {
       class: 'search', placeholder: 'Search decisions…', value: state.query,
-      onInput: e => { state.query = e.target.value; layoutCache.key = null; render(); },
+      onInput: e => { state.query = e.target.value; sim.key = null; render(); reheat(0.5); },
     }),
   ]);
 
@@ -408,7 +496,7 @@ function renderRail(colours) {
       return el('div', {
         class: 'chip',
         style: `border:1px solid ${off ? 'var(--line-soft)' : 'var(--line-strong)'};background:${off ? 'transparent' : 'var(--surface)'};color:${off ? 'var(--muted-3)' : 'var(--ink-2)'}`,
-        onClick: () => { state.statusOff[k] = !off; layoutCache.key = null; render(); },
+        onClick: () => { state.statusOff[k] = !off; sim.key = null; render(); reheat(0.5); },
       }, [
         el('span', { class: 'dot', style: `background:${STATUS[k].color}` }),
         STATUS[k].label,
@@ -425,7 +513,7 @@ function renderRail(colours) {
         return el('div', {
           class: 'chip',
           style: `border:1px solid ${off ? 'var(--line-soft)' : 'var(--line-strong)'};background:${off ? 'transparent' : 'var(--surface)'};color:${off ? 'var(--muted-3)' : 'var(--ink-2)'};letter-spacing:.1em`,
-          onClick: () => { state.sourceOff[s] = !off; layoutCache.key = null; render(); },
+          onClick: () => { state.sourceOff[s] = !off; sim.key = null; render(); reheat(0.5); },
         }, [SOURCE_LABEL[s] || s.toUpperCase(),
             el('span', { style: 'color:var(--muted-2);font-size:9px' }, String(sourceCounts[s] || 0))]);
       })));
@@ -439,7 +527,7 @@ function renderRail(colours) {
         const off = state.clusterOff[name];
         return el('div', {
           class: 'cluster-row', style: `opacity:${off ? 0.45 : 1}`,
-          onClick: () => { state.clusterOff[name] = !off; layoutCache.key = null; render(); },
+          onClick: () => { state.clusterOff[name] = !off; sim.key = null; render(); reheat(0.5); },
         }, [
           el('span', { class: 'swatch', style: `background:${colours[name]}` }),
           el('span', { style: 'flex:1;font-size:11px;color:var(--ink-2)' }, name),
@@ -478,7 +566,7 @@ function renderRail(colours) {
 
 /* Live references into the rendered canvas so a drag can move one node and its
  * edges without re-rendering the whole graph on every mouse move. */
-const refs = { nodes: {}, lines: [], labels: {} };
+const refs = { nodes: {}, lines: [], labels: {}, hubs: {} };
 
 const SVG = 'http://www.w3.org/2000/svg';
 const svgEl = (tag, attrs = {}) => {
@@ -491,7 +579,13 @@ const svgEl = (tag, attrs = {}) => {
  * roughly half the canvas at 28 decisions, which buries the edges the layout
  * exists to show — so they only appear once you are close enough to be reading
  * a few, not scanning all of them. */
-const TIER_LABEL = 0.55, TIER_CARD = 1.0;
+/* Labels are drawn inside the transformed world, so a label and the gap
+ * between two orbs scale together — zooming never separates colliding labels.
+ * The threshold therefore has to sit clear of the fit scale (~0.56 on a full
+ * project) rather than next to it, or the overview lands on whichever side of
+ * the boundary the graph happened to settle. Overview is orbs; labels are for
+ * when the user has deliberately zoomed in to read. */
+const TIER_LABEL = 0.8, TIER_CARD = 1.35;
 const tierFor = scale => (scale < TIER_LABEL ? 'orb' : scale < TIER_CARD ? 'label' : 'card');
 
 /** Edges to other decisions. Cluster membership is structure, not connection. */
@@ -508,25 +602,69 @@ function degrees(list) {
 
 const orbRadius = degree => 5.5 + 3.2 * Math.sqrt(degree || 0);
 
-/** Centre of a node in world space. Layout positions are card top-left, and
- *  those constants are load-bearing, so the centre is derived rather than
- *  changing the simulation. */
-function centreOf(id, pos) {
-  const p = nodePos(id, pos);
-  return p && { x: p.x + NW / 2, y: p.y + NH / 2 };
-}
-
-function endpoint(id, pos) {
-  if (id.startsWith('d:')) return centreOf(Number(id.slice(2)), pos);
-  return pos[id];
-}
-
-function placeLine(entry, pos) {
-  const a = endpoint(entry.a, pos), b = endpoint(entry.b, pos);
+function placeLine(entry) {
+  const a = sim.index[entry.a], b = sim.index[entry.b];
   if (!a || !b) return false;
-  entry.el.setAttribute('x1', a.x); entry.el.setAttribute('y1', a.y);
-  entry.el.setAttribute('x2', b.x); entry.el.setAttribute('y2', b.y);
+  entry.el.setAttribute('x1', a.x * WORLD); entry.el.setAttribute('y1', a.y * WORLD);
+  entry.el.setAttribute('x2', b.x * WORLD); entry.el.setAttribute('y2', b.y * WORLD);
   return true;
+}
+
+/** Write the simulation's positions onto the DOM. Runs every frame while the
+ *  graph is warm, so it touches only style properties and never rebuilds. */
+function paint() {
+  for (const id in refs.nodes) {
+    const node = sim.index['d:' + id], elm = refs.nodes[id];
+    if (!node || !elm) continue;
+    const x = node.x * WORLD, y = node.y * WORLD;
+    if (elm._r !== undefined) {
+      elm.style.left = `${x - elm._r}px`;
+      elm.style.top = `${y - elm._r}px`;
+      const label = refs.labels[id];
+      if (label) {
+        label.style.left = `${x - 90}px`;
+        label.style.top = `${y + elm._r + 5}px`;
+      }
+    } else {
+      elm.style.left = `${x - NW / 2}px`;
+      elm.style.top = `${y - NH / 2}px`;
+    }
+  }
+  for (const name in refs.hubs) {
+    const node = sim.index['cl:' + name], hub = refs.hubs[name];
+    if (!node) continue;
+    const x = node.x * WORLD, y = node.y * WORLD;
+    hub.ring.style.left = `${x - hub.r}px`;
+    hub.ring.style.top = `${y - hub.r}px`;
+    hub.label.style.left = `${x - 110}px`;
+    hub.label.style.top = `${y + hub.r + 6}px`;
+  }
+  refs.lines.forEach(placeLine);
+}
+
+/** Fade everything not connected to the node under the cursor. Obsidian does
+ *  this and it is half of why its graph feels responsive to attention. */
+function setHovered(id) {
+  if (state.hovered === id) return;
+  state.hovered = id;
+
+  const near = new Set();
+  if (id !== null) {
+    near.add(String(id));
+    sim.links.forEach(l => {
+      if (l.a === 'd:' + id && l.b.startsWith('d:')) near.add(l.b.slice(2));
+      if (l.b === 'd:' + id && l.a.startsWith('d:')) near.add(l.a.slice(2));
+    });
+  }
+  for (const nid in refs.nodes) {
+    const faded = id !== null && !near.has(nid);
+    refs.nodes[nid].classList.toggle('faded', faded);
+    if (refs.labels[nid]) refs.labels[nid].classList.toggle('faded', faded);
+  }
+  refs.lines.forEach(entry => {
+    const touches = id !== null && (entry.a === 'd:' + id || entry.b === 'd:' + id);
+    entry.el.classList.toggle('faded', id !== null && !touches);
+  });
 }
 
 let hoverPop = null;
@@ -589,7 +727,8 @@ function renderCanvas(colours) {
     return canvas;
   }
 
-  const { pos, links, clusters } = layout(list);
+  ensureSim(list);
+  const { index: pos, links, clusters } = sim;
   const tier = tierFor(state.scale);
   const degree = degrees(list);
 
@@ -608,6 +747,9 @@ function renderCanvas(colours) {
   // in this graph a node's cluster *is* a connection, so it gets a line.
   refs.lines = [];
   links.forEach(l => {
+    // The root has no visual form, so its spokes would be long lines running
+    // into empty space. It still does its work as a force.
+    if (l.a === '__root' || l.b === '__root') return;
     const structural = !l.kind;
     const line = svgEl('line', {
       stroke: l.kind === 'supersedes' ? 'var(--edge-strong)' : 'var(--edge)',
@@ -616,44 +758,50 @@ function renderCanvas(colours) {
     });
     if (l.kind === 'supersedes') line.setAttribute('stroke-dasharray', '3 3');
     const entry = { el: line, a: l.a, b: l.b };
-    if (!placeLine(entry, pos)) return;
+    if (!placeLine(entry)) return;
     refs.lines.push(entry);
     svg.appendChild(line);
   });
   world.appendChild(svg);
 
+  refs.hubs = {};
   // 2. The cluster itself as a node. The spokes have to terminate somewhere,
   // and a labelled hub identifies the category without tinting the background.
   clusters.forEach(name => {
-    const hub = pos['cl:' + name];
+    const solved = pos['cl:' + name];
     const members = list.filter(d => clusterOf(d) === name);
-    if (!hub || !members.length || name === UNCLUSTERED) return;
+    if (!solved || !members.length || name === UNCLUSTERED) return;
+    const hub = { x: solved.x * WORLD, y: solved.y * WORLD };
     const r = 7 + 1.6 * Math.sqrt(members.length);
-    world.appendChild(el('div', {
+    const ring = el('div', {
       class: 'hub',
       style: `left:${hub.x - r}px;top:${hub.y - r}px;width:${r * 2}px;height:${r * 2}px;`
            + `border-color:${colours[name]}`,
-    }));
-    world.appendChild(el('div', {
+    });
+    const label = el('div', {
       class: 'cluster-label',
       style: `left:${hub.x - 110}px;top:${hub.y + r + 6}px;color:${colours[name]}`,
     }, [
       el('span', {}, name),
       el('span', { class: 'cluster-count' }, String(members.length)),
-    ]));
+    ]);
+    refs.hubs[name] = { ring, label, r };
+    world.appendChild(ring);
+    world.appendChild(label);
   });
 
   // 3. Decisions.
   refs.nodes = {}; refs.labels = {};
   list.forEach(d => {
-    const c = centreOf(d.id, pos);
-    if (!c) return;
+    const solved = centreOf(d.id);
+    if (!solved) return;
+    const c = { x: solved.x * WORLD, y: solved.y * WORLD };
     const chosen = state.selected && state.selected.id === d.id;
     const dim = d.status === 'superseded';
     const colour = colours[clusterOf(d)];
 
     if (tier === 'card') {
-      const p = nodePos(d.id, pos);
+      const p = { x: c.x - NW / 2, y: c.y - NH / 2 };
       const card = el('div', {
         class: 'node' + (chosen ? ' selected' : ''),
         style: `left:${p.x}px;top:${p.y}px;border:1px solid ${chosen ? 'var(--accent)' : 'var(--line)'};`
@@ -672,7 +820,7 @@ function renderCanvas(colours) {
           el('span', { style: 'font-size:8.5px;letter-spacing:.13em;text-transform:uppercase;color:var(--muted)' }, d.cluster),
         ]) : null,
       ]);
-      card.addEventListener('mousedown', e => startNodeDrag(e, d, nodePos(d.id, pos)));
+      card.addEventListener('mousedown', e => startNodeDrag(e, d));
       refs.nodes[d.id] = card;
       world.appendChild(card);
       return;
@@ -685,11 +833,14 @@ function renderCanvas(colours) {
            + `background:${colour};--orb:${colour}`,
       title: '',
     });
-    orb.addEventListener('mousedown', e => startNodeDrag(e, d, nodePos(d.id, pos)));
+    orb.addEventListener('mousedown', e => startNodeDrag(e, d));
     orb.addEventListener('mouseenter', () => {
-      if (!nodeDrag) showPop(d, colour, canvas);
+      if (nodeDrag) return;
+      showPop(d, colour, canvas);
+      setHovered(d.id);
     });
-    orb.addEventListener('mouseleave', hidePop);
+    orb.addEventListener('mouseleave', () => { hidePop(); setHovered(null); });
+    orb._r = r;
     refs.nodes[d.id] = orb;
     world.appendChild(orb);
 
@@ -710,11 +861,11 @@ function renderCanvas(colours) {
     el('div', { class: 'zoom-btn', title: 'Zoom out', onClick: () => zoomBy(1 / 1.25) }, '−'),
     el('div', { class: 'zoom-btn', title: 'Zoom in', onClick: () => zoomBy(1.25) }, '+'),
     el('div', { class: 'zoom-btn', title: 'Fit', style: 'width:auto;padding:0 8px;font-size:9px;letter-spacing:.1em', onClick: () => fit() }, 'FIT'),
-    Object.keys(state.moved).length ? el('div', {
+    Object.keys(state.pinned || {}).length ? el('div', {
       class: 'zoom-btn',
-      title: 'Discard your arrangement and return to the computed layout',
+      title: 'Unpin everything and let the graph settle again',
       style: 'width:auto;padding:0 8px;font-size:9px;letter-spacing:.1em',
-      onClick: () => { state.moved = {}; saveMoved(); render(); queueFit(); },
+      onClick: clearLayout,
     }, 'RESET') : null,
   ]));
 
@@ -801,10 +952,10 @@ function reveal(id) {
   // just clicked often sits. Slide it clear rather than hiding what they asked
   // to look at.
   const canvas = document.getElementById('canvas');
-  const cached = layoutCache.value;
-  if (!canvas || !cached || !state.panelOpen) return;
-  const p = cached.pos['d:' + id];
-  if (!p) return;
+  if (!canvas || !state.panelOpen) return;
+  const centre = centreOf(id);
+  if (!centre) return;
+  const p = { x: centre.x * WORLD - NW / 2, y: centre.y * WORLD - NH / 2 };
   const rect = canvas.getBoundingClientRect();
   const right = state.tx + (p.x + NW) * state.scale;
   const limit = rect.width - 414 - 24;
@@ -818,6 +969,7 @@ const ZOOM_MIN = 0.25, ZOOM_MAX = 1.8;
 
 /** Zoom about a point, keeping whatever is under it fixed. */
 function zoomAt(factor, mx, my, animate = false) {
+  sim.fitOnRest = false;
   const next = Math.min(ZOOM_MAX, Math.max(ZOOM_MIN, state.scale * factor));
   if (next === state.scale) return;
   const wasTier = tierFor(state.scale);
@@ -862,14 +1014,16 @@ let nodeDrag = null;  // repositioning one node
 // Without it, the tiny wobble in a real click swallows every selection.
 const DRAG_THRESHOLD = 4;
 
-function startNodeDrag(event, decision, position) {
+function startNodeDrag(event, decision) {
   if (event.button !== 0) return;
+  const node = centreOf(decision.id);
+  if (!node) return;
   event.preventDefault();
   event.stopPropagation();
   nodeDrag = {
-    decision,
+    decision, node,
     startX: event.clientX, startY: event.clientY,
-    originX: position.x, originY: position.y,
+    originX: node.x, originY: node.y,
     dragged: false,
   };
 }
@@ -889,39 +1043,17 @@ function moveNode(event) {
     if (card) card.classList.add('dragging');
   }
 
-  const id = nodeDrag.decision.id;
-  const next = { x: nodeDrag.originX + dx, y: nodeDrag.originY + dy };
-  state.moved[id] = next;
-
-  // Move the card and its edges directly. A full re-render per mouse move
-  // would rebuild the DOM — and re-running the force layout would fight the
-  // drag by pulling the node back.
-  placeNode(refs.nodes[id], id, next);
-  const { pos } = layout(visible());
-  const key = 'd:' + id;
-  refs.lines.forEach(entry => {
-    if (entry.a === key || entry.b === key) placeLine(entry, pos);
-  });
+  // Move the node itself and let the simulation carry the consequences: the
+  // springs stretch, the neighbours follow, and the graph re-settles. Pinning
+  // during the drag stops the forces fighting the cursor.
+  const node = nodeDrag.node;
+  node.pinned = true;
+  sim.fitOnRest = false;
+  node.x = nodeDrag.originX + dx / WORLD;
+  node.y = nodeDrag.originY + dy / WORLD;
+  node.vx = 0; node.vy = 0;
+  reheat(0.45);
 }
-
-/** Position a rendered node from its world (card top-left) coordinate. */
-function placeNode(element, id, p) {
-  if (!element) return;
-  if (element.classList.contains('orb')) {
-    const r = element.offsetWidth / 2;
-    element.style.left = `${p.x + NW / 2 - r}px`;
-    element.style.top = `${p.y + NH / 2 - r}px`;
-    const label = refs.labels[id];
-    if (label) {
-      label.style.left = `${p.x + NW / 2 - 90}px`;
-      label.style.top = `${p.y + NH / 2 + r + 5}px`;
-    }
-  } else {
-    element.style.left = `${p.x}px`;
-    element.style.top = `${p.y}px`;
-  }
-}
-
 
 function endNodeDrag() {
   const finished = nodeDrag;
@@ -929,8 +1061,11 @@ function endNodeDrag() {
   if (!finished) return;
   document.body.style.cursor = '';
   if (finished.dragged) {
-    saveMoved();
-    render();          // repaint once, so the panel and rail see the new state
+    // Stays where it was put: pinned nodes are excluded from integration.
+    state.pinned['d:' + finished.decision.id] = true;
+    saveLayout();
+    render();          // repaint once, so RESET appears and the rail updates
+    reheat(0.2);
   } else {
     select(finished.decision);
   }
@@ -949,6 +1084,7 @@ function wireCanvas() {
   canvas.addEventListener('mousedown', e => {
     if (e.target.closest('.node') || e.target.closest('.panel') || e.target.closest('.zoom-btn')) return;
     drag = { x: e.clientX - state.tx, y: e.clientY - state.ty };
+    sim.fitOnRest = false;
     canvas.style.cursor = 'grabbing';
   });
 }
@@ -984,6 +1120,9 @@ function render() {
   app.replaceChildren(renderRail(colours), renderCanvas(colours));
   applyTransform();
   wireCanvas();
+  // A repaint replaces the DOM the loop was writing to, so hand it the new
+  // elements; if the graph is still warm it carries on from where it was.
+  if (sim.nodes.length) { paint(); runSim(); }
 }
 
 applyTheme(preferredTheme());
