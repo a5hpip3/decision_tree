@@ -318,3 +318,38 @@ class TestForwardedHeaders:
     def test_takes_the_first_proto_when_chained(self):
         request = self._request({"host": "web.example.com", "x-forwarded-proto": "https,http"})
         assert web.external_base(request) == "https://web.example.com"
+
+
+class TestAssetCacheBusting:
+    """New JS against cached CSS renders as a layout bug, not a cache problem —
+    it cost a debugging cycle once, so the asset URL carries a content hash."""
+
+    def test_version_changes_with_the_bundle(self, tmp_path, monkeypatch):
+        import app as web_module
+
+        monkeypatch.setattr(web_module, "STATIC_DIR", tmp_path)
+        (tmp_path / "app.js").write_text("const a = 1;")
+        (tmp_path / "index.html").write_text("<html></html>")
+        first = web_module.asset_version()
+
+        (tmp_path / "app.js").write_text("const a = 2;")
+        assert web_module.asset_version() != first
+
+    def test_version_is_stable_for_unchanged_files(self, tmp_path, monkeypatch):
+        import app as web_module
+
+        monkeypatch.setattr(web_module, "STATIC_DIR", tmp_path)
+        (tmp_path / "app.js").write_text("const a = 1;")
+        (tmp_path / "index.html").write_text("<html></html>")
+        assert web_module.asset_version() == web_module.asset_version()
+
+    def test_css_changes_also_bust_the_cache(self, tmp_path, monkeypatch):
+        """The styles live in index.html, so a CSS-only edit must bump it too."""
+        import app as web_module
+
+        monkeypatch.setattr(web_module, "STATIC_DIR", tmp_path)
+        (tmp_path / "app.js").write_text("const a = 1;")
+        (tmp_path / "index.html").write_text("<style>.a{}</style>")
+        first = web_module.asset_version()
+        (tmp_path / "index.html").write_text("<style>.a{color:red}</style>")
+        assert web_module.asset_version() != first

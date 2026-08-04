@@ -25,7 +25,13 @@ from authlib.integrations.starlette_client import OAuth, OAuthError
 from starlette.applications import Starlette
 from starlette.middleware import Middleware
 from starlette.middleware.sessions import SessionMiddleware
-from starlette.responses import FileResponse, JSONResponse, RedirectResponse, PlainTextResponse
+from starlette.responses import (
+    FileResponse,
+    HTMLResponse,
+    JSONResponse,
+    PlainTextResponse,
+    RedirectResponse,
+)
 from starlette.routing import Mount, Route
 from starlette.staticfiles import StaticFiles
 
@@ -94,6 +100,18 @@ def api_path_allowed(path: str) -> bool:
     return any(pattern.match(path) for pattern in ALLOWED_API_PATHS)
 
 
+def asset_version() -> str:
+    """Short hash of the front-end bundle, used to bust browser caches."""
+    import hashlib
+
+    digest = hashlib.sha256()
+    for name in ("app.js", "index.html"):
+        path = STATIC_DIR / name
+        if path.exists():
+            digest.update(path.read_bytes())
+    return digest.hexdigest()[:10]
+
+
 def current_user(request) -> dict | None:
     return request.session.get("user")
 
@@ -140,7 +158,12 @@ def build_app(config: Config | None = None, oauth=None) -> Starlette:
     async def index(request):
         if current_user(request) is None:
             return RedirectResponse("/login")
-        return FileResponse(STATIC_DIR / "index.html")
+        # Stamp the asset URL with a hash of the file. Without this a deploy can
+        # leave a browser running new JS against cached CSS, which looks like a
+        # rendering bug rather than a stale cache.
+        html = (STATIC_DIR / "index.html").read_text()
+        html = html.replace("/static/app.js", f"/static/app.js?v={asset_version()}")
+        return HTMLResponse(html, headers={"Cache-Control": "no-cache"})
 
     async def whoami(request):
         user = current_user(request)

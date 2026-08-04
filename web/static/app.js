@@ -210,32 +210,46 @@ function layout(list) {
   return layoutCache.value;
 }
 
-function bbox(list, pos, clusters = []) {
+/** The bounding box of what is actually on screen, in world units.
+ *
+ * Guessing extents per tier does not work: an orb carries a 180px label, sits
+ * in a hull padded 54px, and a cluster title floats 92px above its topmost
+ * member. Measuring the rendered result is exact and survives changes to any
+ * of those. World children are positioned in world units and scaled by the
+ * transform, so offset* and SVG getBBox() are already the coordinates we want.
+ */
+function measuredBBox() {
+  const world = document.getElementById('world');
+  if (!world) return null;
   let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
   const cover = (x, y, w, h) => {
+    if (!isFinite(x) || !isFinite(y) || (!w && !h)) return;
     x0 = Math.min(x0, x); y0 = Math.min(y0, y);
     x1 = Math.max(x1, x + w); y1 = Math.max(y1, y + h);
   };
-  list.forEach(d => {
-    const p = nodePos(d.id, pos); if (!p) return;
-    cover(p.x, p.y, NW, NH);
-  });
-  // Cluster labels are drawn 120px wide, centred on the cluster's own node,
-  // and can sit outside every card — leave them out and they get clipped.
-  clusters.forEach(name => {
-    const p = pos['cl:' + name]; if (!p) return;
-    cover(p.x - 60, p.y - 10, 120, 20);
-  });
-  if (x0 === Infinity) return { x0: 0, y0: 0, x1: 1, y1: 1 };
+  for (const child of world.children) {
+    if (child.tagName.toLowerCase() === 'svg') {
+      for (const shape of child.children) {
+        try {
+          const b = shape.getBBox();
+          cover(b.x, b.y, b.width, b.height);
+        } catch { /* not rendered yet */ }
+      }
+    } else {
+      cover(child.offsetLeft, child.offsetTop, child.offsetWidth, child.offsetHeight);
+    }
+  }
+  if (x0 === Infinity) return null;
   return { x0, y0, x1, y1 };
 }
 
-function fit() {
+function fit(depth = 0) {
   const canvas = document.getElementById('canvas');
   const list = visible();
   if (!canvas || !list.length) return;
-  const { pos } = layout(list);
-  const b = bbox(list, pos);
+  const b = measuredBBox();
+  if (!b) return;
+  const tierBefore = tierFor(state.scale);
   const rect = canvas.getBoundingClientRect(), pad = 40;
   const panel = state.panelOpen && state.selected ? 414 : 0;
   const availW = Math.max(180, rect.width - panel - pad * 2);
@@ -247,17 +261,31 @@ function fit() {
   state.tx = cw > availW ? pad - b.x0 * s : pad + (availW - cw) / 2 - b.x0 * s;
   state.ty = ch > availH ? pad - b.y0 * s : pad + (availH - ch) / 2 - b.y0 * s;
   applyTransform(true);
+  // Fitting can cross a detail threshold, which changes what is drawn and so
+  // what needs fitting. Re-measure once; the second pass always converges
+  // because the tier is already correct for the new scale.
+  if (depth === 0 && tierFor(state.scale) !== tierBefore) {
+    render();
+    requestAnimationFrame(() => fit(1));
+  }
 }
 
 function queueFit(tries = 0) {
-  requestAnimationFrame(() => {
+  // Two frames: the first commits the DOM render() just produced, the second
+  // is where it can actually be measured. Waiting on measuredBBox() as well
+  // covers a canvas that exists but has not laid out its children yet —
+  // fitting against nothing silently leaves the view unfitted.
+  requestAnimationFrame(() => requestAnimationFrame(() => {
     const canvas = document.getElementById('canvas');
-    if (!canvas || canvas.getBoundingClientRect().width < 40) {
+    const ready = canvas
+      && canvas.getBoundingClientRect().width >= 40
+      && measuredBBox();
+    if (!ready) {
       if (tries < 20) queueFit(tries + 1);
       return;
     }
     fit();
-  });
+  }));
 }
 
 function applyTransform(animate = false) {
@@ -265,7 +293,17 @@ function applyTransform(animate = false) {
   if (!world) return;
   // Eased only for button and fit moves. Wheel and drag must track the input
   // exactly; a transition there feels like lag, not smoothness.
-  world.style.transition = animate ? 'transform .18s ease' : 'none';
+  if (animate) {
+    // Commit the current transform before arming the transition. render()
+    // creates a fresh #world every time, and a transition declared on an
+    // element that has never had its transform committed swallows the change
+    // entirely — fit() appeared to do nothing at all.
+    world.style.transition = 'none';
+    void world.offsetWidth;
+    world.style.transition = 'transform .18s ease';
+  } else {
+    world.style.transition = 'none';
+  }
   world.style.transform =
     `translate(${state.tx}px, ${state.ty}px) scale(${state.scale})`;
 }
@@ -401,13 +439,46 @@ function renderRail(colours) {
 
 /* Live references into the rendered canvas so a drag can move one node and its
  * edges without re-rendering the whole graph on every mouse move. */
-const refs = { nodes: {}, lines: [] };
+const refs = { nodes: {}, lines: [], labels: {}, hulls: {} };
+
+const SVG = 'http://www.w3.org/2000/svg';
+const svgEl = (tag, attrs = {}) => {
+  const node = document.createElementNS(SVG, tag);
+  Object.entries(attrs).forEach(([k, v]) => node.setAttribute(k, v));
+  return node;
+};
+
+/* Detail rises with zoom rather than everything shouting at once. Cards cover
+ * roughly half the canvas at 28 decisions, which buries the edges the layout
+ * exists to show — so they only appear once you are close enough to be reading
+ * a few, not scanning all of them. */
+const TIER_LABEL = 0.55, TIER_CARD = 1.0;
+const tierFor = scale => (scale < TIER_LABEL ? 'orb' : scale < TIER_CARD ? 'label' : 'card');
+
+/** Edges to other decisions. Cluster membership is structure, not connection. */
+function degrees(list) {
+  const present = new Set(list.map(d => d.id));
+  const count = {};
+  const bump = id => { if (present.has(id)) count[id] = (count[id] || 0) + 1; };
+  list.forEach(d => {
+    if (d.derives_from && present.has(d.derives_from)) { bump(d.id); bump(d.derives_from); }
+    if (d.supersedes && present.has(d.supersedes)) { bump(d.id); bump(d.supersedes); }
+  });
+  return count;
+}
+
+const orbRadius = degree => 5.5 + 3.2 * Math.sqrt(degree || 0);
+
+/** Centre of a node in world space. Layout positions are card top-left, and
+ *  those constants are load-bearing, so the centre is derived rather than
+ *  changing the simulation. */
+function centreOf(id, pos) {
+  const p = nodePos(id, pos);
+  return p && { x: p.x + NW / 2, y: p.y + NH / 2 };
+}
 
 function endpoint(id, pos) {
-  if (id.startsWith('d:')) {
-    const p = nodePos(Number(id.slice(2)), pos);
-    return p && { x: p.x + NW / 2, y: p.y + NH / 2 };
-  }
+  if (id.startsWith('d:')) return centreOf(Number(id.slice(2)), pos);
   return pos[id];
 }
 
@@ -419,6 +490,81 @@ function placeLine(entry, pos) {
   return true;
 }
 
+/** Convex hull (monotone chain), padded outward from the centroid. */
+function hullPath(points, pad) {
+  if (!points.length) return '';
+  if (points.length === 1) {
+    const [p] = points;
+    return `M ${p.x - pad} ${p.y} a ${pad} ${pad} 0 1 0 ${pad * 2} 0 a ${pad} ${pad} 0 1 0 ${-pad * 2} 0`;
+  }
+  const pts = [...points].sort((a, b) => a.x - b.x || a.y - b.y);
+  const cross = (o, a, b) => (a.x - o.x) * (b.y - o.y) - (a.y - o.y) * (b.x - o.x);
+  const build = source => {
+    const out = [];
+    for (const p of source) {
+      while (out.length >= 2 && cross(out[out.length - 2], out[out.length - 1], p) <= 0) out.pop();
+      out.push(p);
+    }
+    out.pop();
+    return out;
+  };
+  const hull = build(pts).concat(build([...pts].reverse()));
+  const cx = hull.reduce((s, p) => s + p.x, 0) / hull.length;
+  const cy = hull.reduce((s, p) => s + p.y, 0) / hull.length;
+  const grown = hull.map(p => {
+    const dx = p.x - cx, dy = p.y - cy;
+    const len = Math.hypot(dx, dy) || 1;
+    return { x: p.x + (dx / len) * pad, y: p.y + (dy / len) * pad };
+  });
+  // Quadratic smoothing through midpoints: a rounded blob reads as a region,
+  // a polygon reads as another piece of chrome.
+  const mid = (a, b) => ({ x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 });
+  let d = `M ${mid(grown[grown.length - 1], grown[0]).x} ${mid(grown[grown.length - 1], grown[0]).y}`;
+  for (let i = 0; i < grown.length; i++) {
+    const cur = grown[i], next = grown[(i + 1) % grown.length], m = mid(cur, next);
+    d += ` Q ${cur.x} ${cur.y} ${m.x} ${m.y}`;
+  }
+  return d + ' Z';
+}
+
+let hoverPop = null;
+
+function hidePop() {
+  if (hoverPop) { hoverPop.remove(); hoverPop = null; }
+}
+
+function showPop(decision, colour, canvas) {
+  hidePop();
+  const orb = refs.nodes[decision.id];
+  if (!orb) return;
+  const box = orb.getBoundingClientRect();
+  const area = canvas.getBoundingClientRect();
+
+  const pop = el('div', { class: 'pop' }, [
+    el('div', { class: 'pop-meta' }, [
+      decision.cluster
+        ? el('span', { style: `color:${colour};letter-spacing:.13em` }, decision.cluster.toUpperCase())
+        : null,
+      el('span', { style: 'margin-left:auto;color:#B0A89E' }, shortDate(decision.created_at)),
+    ]),
+    el('div', { class: 'pop-title' }, decision.summary),
+  ]);
+
+  // Place above the orb, flipping below when there is no room, and clamped so
+  // it never leaves the canvas.
+  pop.style.visibility = 'hidden';
+  canvas.appendChild(pop);
+  const w = pop.offsetWidth, h = pop.offsetHeight;
+  let left = box.left - area.left + box.width / 2 - w / 2;
+  let top = box.top - area.top - h - 12;
+  if (top < 8) top = box.bottom - area.top + 12;
+  left = Math.max(8, Math.min(area.width - w - 8, left));
+  pop.style.left = `${left}px`;
+  pop.style.top = `${top}px`;
+  pop.style.visibility = '';
+  hoverPop = pop;
+}
+
 function renderCanvas(colours) {
   const list = visible();
   const canvas = el('div', {
@@ -426,40 +572,58 @@ function renderCanvas(colours) {
     style: 'position:relative;overflow:hidden;cursor:grab;background:#F4F0E8',
   });
 
-  if (state.loading) {
+  if (state.loading || state.error || !list.length) {
+    const message = state.error
+      ? state.error
+      : state.loading
+        ? 'Loading…'
+        : state.decisions.length
+          ? 'Nothing matches those filters.'
+          : 'No decisions in this project yet.';
     canvas.appendChild(el('div', {
-      style: 'position:absolute;inset:0;display:flex;align-items:center;justify-content:center;font-size:11px;color:#A0988E',
-    }, 'Loading…'));
-    return canvas;
-  }
-  if (state.error) {
-    canvas.appendChild(el('div', {
-      style: 'position:absolute;inset:0;display:flex;align-items:center;justify-content:center;font-size:11px;color:#A85C3A',
-    }, state.error));
-    return canvas;
-  }
-  if (!list.length) {
-    canvas.appendChild(el('div', {
-      style: 'position:absolute;inset:0;display:flex;align-items:center;justify-content:center;font-size:11px;color:#A0988E',
-    }, state.decisions.length ? 'Nothing matches those filters.' : 'No decisions in this project yet.'));
+      style: 'position:absolute;inset:0;display:flex;align-items:center;justify-content:center;'
+           + `font-size:11px;color:${state.error ? '#A85C3A' : '#A0988E'}`,
+    }, message));
     return canvas;
   }
 
-  const { pos, links } = layout(list);
+  const { pos, links, clusters } = layout(list);
+  const tier = tierFor(state.scale);
+  const degree = degrees(list);
+
   const world = el('div', {
     id: 'world',
     style: 'position:absolute;left:0;top:0;transform-origin:0 0;will-change:transform',
   });
 
-  const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
-  svg.setAttribute('style', 'position:absolute;left:0;top:0;overflow:visible;pointer-events:none');
-  svg.setAttribute('width', '1');
-  svg.setAttribute('height', '1');
+  const svg = svgEl('svg', {
+    style: 'position:absolute;left:0;top:0;overflow:visible;pointer-events:none',
+    width: 1, height: 1,
+  });
+
+  // 1. Cluster regions, behind everything.
+  refs.hulls = {};
+  clusters.forEach(name => {
+    const members = list.filter(d => clusterOf(d) === name)
+      .map(d => centreOf(d.id, pos)).filter(Boolean);
+    if (!members.length) return;
+    const path = svgEl('path', {
+      d: hullPath(members, 54),
+      fill: colours[name], 'fill-opacity': 0.07,
+      stroke: colours[name], 'stroke-opacity': 0.22, 'stroke-width': 1,
+    });
+    refs.hulls[name] = { el: path, name };
+    svg.appendChild(path);
+  });
+
+  // 2. Edges.
   refs.lines = [];
-  links.forEach(l => {
-    const line = document.createElementNS('http://www.w3.org/2000/svg', 'line');
-    line.setAttribute('stroke', l.kind === 'supersedes' ? '#C9B79E' : l.kind ? '#CBBFAC' : '#E2DACD');
-    line.setAttribute('stroke-width', l.kind === 'derives' ? 1.2 : 1);
+  links.filter(l => l.kind).forEach(l => {
+    const line = svgEl('line', {
+      stroke: l.kind === 'supersedes' ? '#C0AE93' : '#B9AC97',
+      'stroke-width': l.kind === 'derives' ? 1.4 : 1,
+      'stroke-opacity': 0.85,
+    });
     if (l.kind === 'supersedes') line.setAttribute('stroke-dasharray', '3 3');
     const entry = { el: line, a: l.a, b: l.b };
     if (!placeLine(entry, pos)) return;
@@ -468,44 +632,80 @@ function renderCanvas(colours) {
   });
   world.appendChild(svg);
 
-  // Cluster labels sit on their virtual node, behind the cards.
-  layout(list).clusters.forEach(name => {
-    const p = pos['cl:' + name];
-    if (!p || name === UNCLUSTERED) return;
+  // 3. Cluster labels, sitting on the region rather than on a node.
+  clusters.forEach(name => {
+    const members = list.filter(d => clusterOf(d) === name)
+      .map(d => centreOf(d.id, pos)).filter(Boolean);
+    if (!members.length || name === UNCLUSTERED) return;
+    const cx = members.reduce((s, p) => s + p.x, 0) / members.length;
+    const top = Math.min(...members.map(p => p.y));
     world.appendChild(el('div', {
-      style: `position:absolute;left:${p.x - 60}px;top:${p.y - 10}px;width:120px;text-align:center;` +
-             `font-size:9px;letter-spacing:.16em;text-transform:uppercase;color:${colours[name]};opacity:.75;pointer-events:none`,
-    }, name));
+      class: 'cluster-label',
+      style: `left:${cx - 110}px;top:${top - 92}px;color:${colours[name]}`,
+    }, [
+      el('span', {}, name),
+      el('span', { class: 'cluster-count' }, String(members.length)),
+    ]));
   });
 
-  refs.nodes = {};
+  // 4. Nodes.
+  refs.nodes = {}; refs.labels = {};
   list.forEach(d => {
-    const p = nodePos(d.id, pos);
-    if (!p) return;
+    const c = centreOf(d.id, pos);
+    if (!c) return;
     const chosen = state.selected && state.selected.id === d.id;
     const dim = d.status === 'superseded';
     const colour = colours[clusterOf(d)];
-    const card = el('div', {
-      class: 'node',
-      style: `left:${p.x}px;top:${p.y}px;border:1px solid ${chosen ? '#A85C3A' : '#E2DACD'};` +
-             `opacity:${dim ? 0.55 : 1};box-shadow:${chosen ? '0 8px 22px rgba(28,25,23,.13)' : 'none'}`,
-    }, [
-      el('div', { class: 'node-meta' }, [
-        d.source ? el('span', { class: 'tag' }, SOURCE_LABEL[d.source] || d.source.toUpperCase()) : null,
-        el('span', { class: 'dot', style: `background:${(STATUS[d.status] || {}).color || '#A9A198'}` }),
-        el('span', { style: 'font-size:8.5px;letter-spacing:.08em;color:#A9A198;text-transform:uppercase' },
-          (STATUS[d.status] || {}).label || d.status),
-        el('span', { style: 'margin-left:auto;font-size:9px;color:#B0A89E' }, shortDate(d.created_at)),
-      ]),
-      el('div', { class: 'node-title' }, d.summary),
-      d.cluster ? el('div', { class: 'node-cluster' }, [
-        el('span', { style: `width:5px;height:5px;background:${colour}` }),
-        el('span', { style: 'font-size:8.5px;letter-spacing:.13em;text-transform:uppercase;color:#A0988E' }, d.cluster),
-      ]) : null,
-    ]);
-    card.addEventListener('mousedown', e => startNodeDrag(e, d, p));
-    refs.nodes[d.id] = card;
-    world.appendChild(card);
+
+    if (tier === 'card') {
+      const p = nodePos(d.id, pos);
+      const card = el('div', {
+        class: 'node' + (chosen ? ' selected' : ''),
+        style: `left:${p.x}px;top:${p.y}px;border:1px solid ${chosen ? '#A85C3A' : '#E2DACD'};`
+             + `opacity:${dim ? 0.55 : 1}`,
+      }, [
+        el('div', { class: 'node-meta' }, [
+          d.source ? el('span', { class: 'tag' }, SOURCE_LABEL[d.source] || d.source.toUpperCase()) : null,
+          el('span', { class: 'dot', style: `background:${(STATUS[d.status] || {}).color || '#A9A198'}` }),
+          el('span', { style: 'font-size:8.5px;letter-spacing:.08em;color:#A9A198;text-transform:uppercase' },
+            (STATUS[d.status] || {}).label || d.status),
+          el('span', { style: 'margin-left:auto;font-size:9px;color:#B0A89E' }, shortDate(d.created_at)),
+        ]),
+        el('div', { class: 'node-title' }, d.summary),
+        d.cluster ? el('div', { class: 'node-cluster' }, [
+          el('span', { style: `width:5px;height:5px;background:${colour}` }),
+          el('span', { style: 'font-size:8.5px;letter-spacing:.13em;text-transform:uppercase;color:#A0988E' }, d.cluster),
+        ]) : null,
+      ]);
+      card.addEventListener('mousedown', e => startNodeDrag(e, d, nodePos(d.id, pos)));
+      refs.nodes[d.id] = card;
+      world.appendChild(card);
+      return;
+    }
+
+    const r = orbRadius(degree[d.id]);
+    const orb = el('div', {
+      class: 'orb' + (chosen ? ' selected' : '') + (dim ? ' dim' : ''),
+      style: `left:${c.x - r}px;top:${c.y - r}px;width:${r * 2}px;height:${r * 2}px;`
+           + `background:${colour};--orb:${colour}`,
+      title: '',
+    });
+    orb.addEventListener('mousedown', e => startNodeDrag(e, d, nodePos(d.id, pos)));
+    orb.addEventListener('mouseenter', () => {
+      if (!nodeDrag) showPop(d, colour, canvas);
+    });
+    orb.addEventListener('mouseleave', hidePop);
+    refs.nodes[d.id] = orb;
+    world.appendChild(orb);
+
+    if (tier === 'label') {
+      const label = el('div', {
+        class: 'orb-label',
+        style: `left:${c.x - 90}px;top:${c.y + r + 5}px;opacity:${dim ? 0.5 : 1}`,
+      }, d.summary);
+      refs.labels[d.id] = label;
+      world.appendChild(label);
+    }
   });
 
   canvas.appendChild(world);
@@ -625,10 +825,13 @@ const ZOOM_MIN = 0.25, ZOOM_MAX = 1.8;
 function zoomAt(factor, mx, my, animate = false) {
   const next = Math.min(ZOOM_MAX, Math.max(ZOOM_MIN, state.scale * factor));
   if (next === state.scale) return;
+  const wasTier = tierFor(state.scale);
   state.tx = mx - (mx - state.tx) * (next / state.scale);
   state.ty = my - (my - state.ty) * (next / state.scale);
   state.scale = next;
   applyTransform(animate);
+  // Crossing a detail threshold changes what is drawn, not just its size.
+  if (tierFor(next) !== wasTier) { hidePop(); render(); }
 }
 
 function zoomBy(factor) {
@@ -685,6 +888,7 @@ function moveNode(event) {
   }
   if (!nodeDrag.dragged) {
     nodeDrag.dragged = true;
+    hidePop();
     document.body.style.cursor = 'grabbing';
     const card = refs.nodes[nodeDrag.decision.id];
     if (card) card.classList.add('dragging');
@@ -697,14 +901,32 @@ function moveNode(event) {
   // Move the card and its edges directly. A full re-render per mouse move
   // would rebuild the DOM — and re-running the force layout would fight the
   // drag by pulling the node back.
-  const card = refs.nodes[id];
-  if (card) { card.style.left = `${next.x}px`; card.style.top = `${next.y}px`; }
+  placeNode(refs.nodes[id], id, next);
   const { pos } = layout(visible());
   const key = 'd:' + id;
   refs.lines.forEach(entry => {
     if (entry.a === key || entry.b === key) placeLine(entry, pos);
   });
 }
+
+/** Position a rendered node from its world (card top-left) coordinate. */
+function placeNode(element, id, p) {
+  if (!element) return;
+  if (element.classList.contains('orb')) {
+    const r = element.offsetWidth / 2;
+    element.style.left = `${p.x + NW / 2 - r}px`;
+    element.style.top = `${p.y + NH / 2 - r}px`;
+    const label = refs.labels[id];
+    if (label) {
+      label.style.left = `${p.x + NW / 2 - 90}px`;
+      label.style.top = `${p.y + NH / 2 + r + 5}px`;
+    }
+  } else {
+    element.style.left = `${p.x}px`;
+    element.style.top = `${p.y}px`;
+  }
+}
+
 
 function endNodeDrag() {
   const finished = nodeDrag;

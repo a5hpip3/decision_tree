@@ -72,6 +72,57 @@
   }
   .node-cluster { margin-top:6px; display:flex; align-items:center; gap:6px; }
 
+  /* An orb is ~1/40th the area of a card, which is what lets the edges and
+     cluster regions underneath actually be seen. */
+  .orb {
+    position:absolute; border-radius:50%; cursor:grab;
+    box-shadow:0 0 0 3px rgba(244,240,232,.9);
+    transition:transform .14s ease, box-shadow .14s ease, opacity .14s ease;
+  }
+  .orb:hover { transform:scale(1.35); z-index:3; }
+  .orb.dim { opacity:.45; }
+  .orb.selected {
+    box-shadow:0 0 0 3px rgba(244,240,232,.9), 0 0 0 5px #A85C3A;
+    transform:scale(1.2);
+  }
+  .orb.dragging { cursor:grabbing; }
+
+  .orb-label {
+    position:absolute; width:180px; text-align:center; pointer-events:none;
+    font-family:Newsreader, serif; font-size:11.5px; line-height:1.25; color:#4A443D;
+    display:-webkit-box; -webkit-box-orient:vertical; -webkit-line-clamp:2; overflow:hidden;
+    /* Paper-coloured halo so a label stays readable where it crosses an edge. */
+    text-shadow:0 0 4px #F4F0E8, 0 0 4px #F4F0E8, 0 0 8px #F4F0E8;
+  }
+
+  .cluster-label {
+    position:absolute; width:220px; text-align:center; pointer-events:none;
+    font-size:10px; letter-spacing:.18em; text-transform:uppercase; font-weight:500;
+    display:flex; align-items:center; justify-content:center; gap:7px;
+    text-shadow:0 0 5px #F4F0E8, 0 0 10px #F4F0E8;
+  }
+  .cluster-count {
+    font-size:9px; letter-spacing:.04em; opacity:.6;
+    border:1px solid currentColor; border-radius:8px; padding:0 5px; line-height:1.5;
+  }
+
+  /* Hover card: the text a card used to show, on demand. */
+  .pop {
+    position:absolute; z-index:6; width:236px; padding:10px 12px 11px;
+    background:#FFFDF9; border:1px solid #DED5C6; border-radius:4px;
+    box-shadow:0 10px 26px rgba(28,25,23,.14);
+    pointer-events:none; transform-origin:50% 100%;
+    animation:popIn .13s cubic-bezier(.2,.8,.3,1) both;
+  }
+  .pop-meta { display:flex; align-items:center; font-size:8.5px; margin-bottom:6px; }
+  .pop-title { font-family:Newsreader, serif; font-size:13.5px; line-height:1.3; color:#1C1917; }
+  @keyframes popIn {
+    from { opacity:0; transform:scale(.94) translateY(3px); }
+    to   { opacity:1; transform:none; }
+  }
+
+  .node.selected { box-shadow:0 8px 22px rgba(28,25,23,.13); }
+
   .panel {
     position:absolute; top:0; right:0; bottom:0; width:414px; background:#F9F6F0;
     border-left:1px solid #E2DACD; overflow-y:auto; animation:omSlide .18s ease both; z-index:5;

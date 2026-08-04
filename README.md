@@ -487,6 +487,27 @@ are kept per project in `localStorage`, because an arrangement that vanished on
 the next filter change or reload would not be worth making. `RESET` appears
 once anything has moved and returns to the computed layout.
 
+Decisions render as orbs, not cards. At 28 decisions the cards covered about
+55% of the canvas, burying the edges and cluster regions the layout exists to
+show. An orb is roughly a fortieth of that area, sized by how many decisions it
+connects to, and coloured by cluster — so cluster identity goes from a 5px
+swatch to the primary signal. Each cluster also gets a soft tinted hull and a
+labelled count, which groups the picture into seven regions rather than 28
+scattered items.
+
+Detail rises with zoom rather than everything shouting at once:
+
+| Scale | Shows |
+|---|---|
+| below 0.55 | orbs only |
+| 0.55 – 1.0 | orbs with a two-line label |
+| above 1.0 | the full card, as before |
+
+Hovering an orb pops the summary; clicking opens the same side panel. `fit()`
+measures the rendered result rather than assuming a footprint — an orb carries
+a 180px label and sits inside a hull padded 54px, so guessing extents put
+content off the edge.
+
 Wheel zoom scales with the reported delta rather than applying a fixed step
 per event. A trackpad flick emits dozens of wheel events, so a constant factor
 compounded to nothing and the view bottomed out on the lightest touch. The
