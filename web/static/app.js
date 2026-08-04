@@ -478,7 +478,7 @@ function renderRail(colours) {
 
 /* Live references into the rendered canvas so a drag can move one node and its
  * edges without re-rendering the whole graph on every mouse move. */
-const refs = { nodes: {}, lines: [], labels: {}, hulls: {} };
+const refs = { nodes: {}, lines: [], labels: {} };
 
 const SVG = 'http://www.w3.org/2000/svg';
 const svgEl = (tag, attrs = {}) => {
@@ -527,43 +527,6 @@ function placeLine(entry, pos) {
   entry.el.setAttribute('x1', a.x); entry.el.setAttribute('y1', a.y);
   entry.el.setAttribute('x2', b.x); entry.el.setAttribute('y2', b.y);
   return true;
-}
-
-/** Convex hull (monotone chain), padded outward from the centroid. */
-function hullPath(points, pad) {
-  if (!points.length) return '';
-  if (points.length === 1) {
-    const [p] = points;
-    return `M ${p.x - pad} ${p.y} a ${pad} ${pad} 0 1 0 ${pad * 2} 0 a ${pad} ${pad} 0 1 0 ${-pad * 2} 0`;
-  }
-  const pts = [...points].sort((a, b) => a.x - b.x || a.y - b.y);
-  const cross = (o, a, b) => (a.x - o.x) * (b.y - o.y) - (a.y - o.y) * (b.x - o.x);
-  const build = source => {
-    const out = [];
-    for (const p of source) {
-      while (out.length >= 2 && cross(out[out.length - 2], out[out.length - 1], p) <= 0) out.pop();
-      out.push(p);
-    }
-    out.pop();
-    return out;
-  };
-  const hull = build(pts).concat(build([...pts].reverse()));
-  const cx = hull.reduce((s, p) => s + p.x, 0) / hull.length;
-  const cy = hull.reduce((s, p) => s + p.y, 0) / hull.length;
-  const grown = hull.map(p => {
-    const dx = p.x - cx, dy = p.y - cy;
-    const len = Math.hypot(dx, dy) || 1;
-    return { x: p.x + (dx / len) * pad, y: p.y + (dy / len) * pad };
-  });
-  // Quadratic smoothing through midpoints: a rounded blob reads as a region,
-  // a polygon reads as another piece of chrome.
-  const mid = (a, b) => ({ x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 });
-  let d = `M ${mid(grown[grown.length - 1], grown[0]).x} ${mid(grown[grown.length - 1], grown[0]).y}`;
-  for (let i = 0; i < grown.length; i++) {
-    const cur = grown[i], next = grown[(i + 1) % grown.length], m = mid(cur, next);
-    d += ` Q ${cur.x} ${cur.y} ${m.x} ${m.y}`;
-  }
-  return d + ' Z';
 }
 
 let hoverPop = null;
@@ -640,29 +603,16 @@ function renderCanvas(colours) {
     width: 1, height: 1,
   });
 
-  // 1. Cluster regions, behind everything.
-  refs.hulls = {};
-  clusters.forEach(name => {
-    const members = list.filter(d => clusterOf(d) === name)
-      .map(d => centreOf(d.id, pos)).filter(Boolean);
-    if (!members.length) return;
-    const path = svgEl('path', {
-      d: hullPath(members, 54),
-      fill: colours[name], 'fill-opacity': cssVar('--hull-fill') || 0.07,
-      stroke: colours[name], 'stroke-opacity': cssVar('--hull-stroke') || 0.22,
-      'stroke-width': 1,
-    });
-    refs.hulls[name] = { el: path, name };
-    svg.appendChild(path);
-  });
-
-  // 2. Edges.
+  // 1. Every edge, including the structural cluster spokes. Drawing only the
+  // typed ones left any decision without a derives_from as an isolated dot —
+  // in this graph a node's cluster *is* a connection, so it gets a line.
   refs.lines = [];
-  links.filter(l => l.kind).forEach(l => {
+  links.forEach(l => {
+    const structural = !l.kind;
     const line = svgEl('line', {
       stroke: l.kind === 'supersedes' ? 'var(--edge-strong)' : 'var(--edge)',
-      'stroke-width': l.kind === 'derives' ? 1.4 : 1,
-      'stroke-opacity': 0.85,
+      'stroke-width': l.kind === 'derives' ? 1.5 : 1,
+      'stroke-opacity': structural ? 0.5 : 0.9,
     });
     if (l.kind === 'supersedes') line.setAttribute('stroke-dasharray', '3 3');
     const entry = { el: line, a: l.a, b: l.b };
@@ -672,23 +622,28 @@ function renderCanvas(colours) {
   });
   world.appendChild(svg);
 
-  // 3. Cluster labels, sitting on the region rather than on a node.
+  // 2. The cluster itself as a node. The spokes have to terminate somewhere,
+  // and a labelled hub identifies the category without tinting the background.
   clusters.forEach(name => {
-    const members = list.filter(d => clusterOf(d) === name)
-      .map(d => centreOf(d.id, pos)).filter(Boolean);
-    if (!members.length || name === UNCLUSTERED) return;
-    const cx = members.reduce((s, p) => s + p.x, 0) / members.length;
-    const top = Math.min(...members.map(p => p.y));
+    const hub = pos['cl:' + name];
+    const members = list.filter(d => clusterOf(d) === name);
+    if (!hub || !members.length || name === UNCLUSTERED) return;
+    const r = 7 + 1.6 * Math.sqrt(members.length);
+    world.appendChild(el('div', {
+      class: 'hub',
+      style: `left:${hub.x - r}px;top:${hub.y - r}px;width:${r * 2}px;height:${r * 2}px;`
+           + `border-color:${colours[name]}`,
+    }));
     world.appendChild(el('div', {
       class: 'cluster-label',
-      style: `left:${cx - 110}px;top:${top - 92}px;color:${colours[name]}`,
+      style: `left:${hub.x - 110}px;top:${hub.y + r + 6}px;color:${colours[name]}`,
     }, [
       el('span', {}, name),
       el('span', { class: 'cluster-count' }, String(members.length)),
     ]));
   });
 
-  // 4. Nodes.
+  // 3. Decisions.
   refs.nodes = {}; refs.labels = {};
   list.forEach(d => {
     const c = centreOf(d.id, pos);

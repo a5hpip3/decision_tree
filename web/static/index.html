@@ -130,6 +130,12 @@
     text-shadow:0 0 4px var(--canvas), 0 0 4px var(--canvas), 0 0 8px var(--canvas);
   }
 
+  /* A hollow ring so a cluster reads as a container, not another decision. */
+  .hub {
+    position:absolute; border-radius:50%; border:1.5px solid; opacity:.75;
+    background:transparent; pointer-events:none;
+  }
+
   .cluster-label {
     position:absolute; width:220px; text-align:center; pointer-events:none;
     font-size:10px; letter-spacing:.18em; text-transform:uppercase; font-weight:500;

@@ -508,9 +508,14 @@ Decisions render as orbs, not cards. At 28 decisions the cards covered about
 55% of the canvas, burying the edges and cluster regions the layout exists to
 show. An orb is roughly a fortieth of that area, sized by how many decisions it
 connects to, and coloured by cluster — so cluster identity goes from a 5px
-swatch to the primary signal. Each cluster also gets a soft tinted hull and a
-labelled count, which groups the picture into seven regions rather than 28
-scattered items.
+swatch to the primary signal. Each cluster is drawn as a hollow ring — a node in its
+own right — with a labelled count, and its decisions connect to it.
+
+Every edge is drawn, including those cluster spokes. Rendering only the typed
+edges left any decision without a `derives_from` as an isolated dot; in this
+graph a decision's cluster *is* a connection, so it gets a line. There is no
+tinted background behind a cluster: once the orbs carry the colour, a second
+colour layer says nothing the orbs do not.
 
 Detail rises with zoom rather than everything shouting at once:
 
