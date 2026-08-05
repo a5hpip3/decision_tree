@@ -321,11 +321,14 @@ function runSim() {
     } else {
       sim.frame = null;
       saveLayout();      // at rest: remember where everything landed
-      // Settling moves the orbs apart, which can be what makes labels fit.
-      const before = tierFor(state.scale);
+      // Settling changes how far apart the orbs are, and the detail tier is
+      // decided by that — a graph drawn with labels from its seed positions
+      // has to lose them once it closes up. Compared against what the DOM was
+      // actually drawn as, not against a tier recomputed from a spacing that
+      // is about to change underneath it.
       sim.spacing = measureSpacing();
       if (sim.fitOnRest) { sim.fitOnRest = false; fit(); }
-      else if (tierFor(state.scale) !== before) render();
+      if (tierFor(state.scale) !== sim.tier) render();
     }
   };
   sim.frame = requestAnimationFrame(tick);
@@ -764,6 +767,7 @@ function renderCanvas(colours) {
   const { index: pos, links, clusters } = sim;
   sim.spacing = measureSpacing();
   const tier = tierFor(state.scale);
+  sim.tier = tier;   // what the DOM now holds, for anything that has to reconcile
   const degree = degrees(list);
 
   const world = el('div', {
