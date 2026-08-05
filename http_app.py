@@ -117,6 +117,33 @@ def request_origin(scope) -> str:
     return f"{scheme.split(',')[0].strip()}://{host}"
 
 
+def canonical_resource(scope) -> str:
+    """The one resource identifier every endpoint advertises.
+
+    RFC 8707 makes the resource an audience the authorization server has to
+    recognise, and Auth0 wants each one registered as an API. Advertising a
+    URL per project therefore meant a tenant admin registering an API every
+    time somebody started a project — which a teammate creating one cannot do,
+    and which fails with "Service not found" until they have.
+
+    One identifier for the whole server instead. The per-project audience used
+    to be the access control, back when holding a token was the same as being
+    allowed in; membership decides that now, per project, so scoping the
+    audience as well bought isolation that was already there.
+    """
+    return f"{request_origin(scope)}{ROUTER_PATH}"
+
+
+def acceptable_resources(scope, project) -> list:
+    """Audiences a token may name. The canonical one, and — for a pinned
+    endpoint — the URL it used to advertise, so tokens already issued against
+    it keep working."""
+    urls = [canonical_resource(scope)]
+    if project is not None:
+        urls.append(resource_url_for(scope, project))
+    return urls
+
+
 def resource_url_for(scope, project):
     """The canonical URI of the endpoint being addressed.
 
@@ -231,7 +258,7 @@ def build_app(
             log.warning("auth: unexpanded %s for project=%s", placeholder, project)
             return placeholder_reason(placeholder), None
 
-        expected = resource_url_for(scope, project)
+        expected = acceptable_resources(scope, project)
         try:
             claims = await verifier.verify(presented, expected)
         except oauth.AuthError as exc:
@@ -348,7 +375,7 @@ async def _api_authorized(scope, oauth_config, verifier):
     placeholder = unexpanded_variable(presented)
     if placeholder:
         return placeholder_reason(placeholder), None
-    expected = f"{request_origin(scope)}{ROUTER_PATH}"
+    expected = canonical_resource(scope)
     try:
         claims = await verifier.verify(presented, expected)
     except oauth.AuthError as exc:
@@ -434,12 +461,10 @@ async def _metadata_response(scope, receive, send, path, oauth_config):
         )
         return
 
-    if router:
-        resource = f"{request_origin(scope)}{ROUTER_PATH}"
-    elif project:
-        resource = resource_url_for(scope, project)
-    else:
-        resource = f"{request_origin(scope)}{PREFIX}<project>{MCP_SUFFIX}"
+    # Advertised for every endpoint, project-pinned or not: it is what the
+    # client will send as `resource`, and it has to be something the
+    # authorization server has been told about exactly once.
+    resource = canonical_resource(scope)
     await JSONResponse(oauth.protected_resource_metadata(resource, oauth_config))(
         scope, receive, send
     )

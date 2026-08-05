@@ -99,12 +99,20 @@ class TokenVerifier:
             raise AuthError(f"missing required scope(s): {' '.join(sorted(missing))}")
         return claims
 
-    async def verify(self, token: str, resource_url: str) -> dict:
-        """Verify a bearer token for the given per-project resource URL.
+    async def verify(self, token: str, resource_url) -> dict:
+        """Verify a bearer token against one or more acceptable resource URLs.
+
+        A list passes if the token names any of them, which is how a token
+        minted for the whole server is accepted at a per-project endpoint.
 
         Raises AuthError if the token is not valid for this resource.
         """
-        audience = self.config.audience or resource_url
+        if self.config.audience:
+            audience = self.config.audience
+        elif isinstance(resource_url, str):
+            audience = resource_url
+        else:
+            audience = list(resource_url)
         # PyJWKClient does blocking network I/O when the key cache misses.
         return await anyio.to_thread.run_sync(self._verify_sync, token, audience)
 

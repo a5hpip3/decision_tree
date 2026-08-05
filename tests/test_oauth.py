@@ -275,22 +275,79 @@ class TestOverHttp:
             oauth_config=config, verifier=oauth.TokenVerifier(config, jwk_client=stub), **kwargs
         )
 
-    def test_metadata_served_per_project(self, vault, keypair):
+    def test_every_endpoint_advertises_one_resource(self, vault, keypair):
+        """The client sends this back as `resource`, and RFC 8707 makes that an
+        audience the authorization server has to already know about.
+
+        Advertising a URL per project meant registering an API per project —
+        which a teammate starting one cannot do, and which fails outright until
+        somebody has. One identifier for the whole server instead; membership
+        is what separates the projects.
+        """
+
         async def scenario():
             import httpx2
 
             async with Server(self._app(keypair)) as srv:
                 base = f"http://127.0.0.1:{srv.port}"
                 async with httpx2.AsyncClient() as client:
-                    return await client.get(
-                        f"{base}/.well-known/oauth-protected-resource/p/decision-tree/mcp"
+                    return base, [
+                        await client.get(f"{base}{path}")
+                        for path in (
+                            "/.well-known/oauth-protected-resource/p/decision-tree/mcp",
+                            "/.well-known/oauth-protected-resource/p/hopscotch/mcp",
+                            "/.well-known/oauth-protected-resource/mcp",
+                            "/.well-known/oauth-protected-resource",
+                        )
+                    ]
+
+        base, responses = run(scenario())
+        assert [r.status_code for r in responses] == [200, 200, 200, 200]
+        resources = {r.json()["resource"] for r in responses}
+        assert resources == {f"{base}/mcp"}, resources
+        assert responses[0].json()["authorization_servers"] == [
+            "https://tenant.us.auth0.com/"
+        ]
+
+    def test_a_token_for_the_server_works_on_any_project_endpoint(self, vault, keypair):
+        """One audience, and membership decides which projects it reaches.
+
+        Before membership existed the audience was the access control, so a
+        per-project one was load-bearing. It is not any more, and keeping it
+        cost an Auth0 API registration per project.
+        """
+        add_member("hopscotch", "member@example.com", "owner")
+
+        async def scenario():
+            async with Server(self._app(keypair)) as srv:
+                token = make_token(
+                    keypair,
+                    aud=f"http://127.0.0.1:{srv.port}/mcp",
+                    sub="auth0|m",
+                    **{server.EMAIL_CLAIM: "member@example.com"},
+                )
+                return await call(
+                    srv.url("hopscotch"), "get_project_brief",
+                    headers={"Authorization": f"Bearer {token}"},
+                )
+
+        assert "hopscotch" in run(scenario())
+
+    def test_a_token_for_a_different_project_is_still_rejected(self, vault, keypair):
+        """Relaxing the audience must not make any old audience acceptable."""
+
+        async def scenario():
+            import httpx2
+
+            async with Server(self._app(keypair)) as srv:
+                token = make_token(keypair, aud="https://somewhere.else/p/x/mcp")
+                async with httpx2.AsyncClient() as client:
+                    return await client.post(
+                        srv.url("hopscotch"), json={},
+                        headers={"Authorization": f"Bearer {token}"},
                     )
 
-        response = run(scenario())
-        assert response.status_code == 200
-        body = response.json()
-        assert body["resource"].endswith("/p/decision-tree/mcp")
-        assert body["authorization_servers"] == ["https://tenant.us.auth0.com/"]
+        assert run(scenario()).status_code == 401
 
     def test_unauthenticated_call_challenges_with_metadata_pointer(self, vault, keypair):
         async def scenario():
