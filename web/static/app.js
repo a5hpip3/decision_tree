@@ -321,7 +321,11 @@ function runSim() {
     } else {
       sim.frame = null;
       saveLayout();      // at rest: remember where everything landed
+      // Settling moves the orbs apart, which can be what makes labels fit.
+      const before = tierFor(state.scale);
+      sim.spacing = measureSpacing();
       if (sim.fitOnRest) { sim.fitOnRest = false; fit(); }
+      else if (tierFor(state.scale) !== before) render();
     }
   };
   sim.frame = requestAnimationFrame(tick);
@@ -579,14 +583,43 @@ const svgEl = (tag, attrs = {}) => {
  * roughly half the canvas at 28 decisions, which buries the edges the layout
  * exists to show — so they only appear once you are close enough to be reading
  * a few, not scanning all of them. */
-/* Labels are drawn inside the transformed world, so a label and the gap
- * between two orbs scale together — zooming never separates colliding labels.
- * The threshold therefore has to sit clear of the fit scale (~0.56 on a full
- * project) rather than next to it, or the overview lands on whichever side of
- * the boundary the graph happened to settle. Overview is orbs; labels are for
- * when the user has deliberately zoomed in to read. */
-const TIER_LABEL = 0.8, TIER_CARD = 1.35;
-const tierFor = scale => (scale < TIER_LABEL ? 'orb' : scale < TIER_CARD ? 'label' : 'card');
+/* When labels appear, decided by how far apart the orbs actually are.
+ *
+ * A fixed scale threshold cannot hold. The graph grows every time a decision
+ * is logged, the fit scale rises with it, and whatever number was picked gets
+ * crossed — which is how a 28-decision project that showed clean orbs became
+ * a 38-decision one showing labels stacked on top of each other.
+ *
+ * Spacing is what a label actually needs, so that is what gets measured: the
+ * median gap between neighbouring orbs, on screen, against the width a label
+ * occupies. Independent of how big the graph has grown.
+ */
+const LABEL_GAP = 150;   // on-screen px a label needs beside its orb
+const CARD_GAP = 260;    // a card is wider still, so it needs more
+
+function measureSpacing() {
+  const ds = sim.nodes.filter(n => n.id.startsWith('d:'));
+  if (ds.length < 2) return Infinity;
+  const gaps = ds.map(p => {
+    let nearest = Infinity;
+    for (const q of ds) {
+      if (q === p) continue;
+      nearest = Math.min(nearest, Math.hypot(p.x - q.x, p.y - q.y));
+    }
+    return nearest * WORLD;
+  }).sort((a, b) => a - b);
+  // Median rather than minimum: one tight pair should not hide every label.
+  return gaps[Math.floor(gaps.length / 2)];
+}
+
+const tierFor = scale => {
+  // Both thresholds are spacing, not zoom. Cards were gated on scale alone,
+  // which meant a dense graph jumped from orbs straight to cards — and a card
+  // is wider than a label, so it overlapped worse than the labels that had
+  // just been suppressed for not fitting.
+  const gap = (sim.spacing || 0) * scale;
+  return gap >= CARD_GAP ? 'card' : gap >= LABEL_GAP ? 'label' : 'orb';
+};
 
 /** Edges to other decisions. Cluster membership is structure, not connection. */
 function degrees(list) {
@@ -729,6 +762,7 @@ function renderCanvas(colours) {
 
   ensureSim(list);
   const { index: pos, links, clusters } = sim;
+  sim.spacing = measureSpacing();
   const tier = tierFor(state.scale);
   const degree = degrees(list);
 
@@ -965,7 +999,12 @@ function reveal(id) {
   }
 }
 
-const ZOOM_MIN = 0.25, ZOOM_MAX = 1.8;
+/* The ceiling has to clear the detail tiers, which are now spacing-based and
+ * so move with the size of the graph. At 38 decisions labels want ~1.9x and
+ * cards ~3.3x; at 200 it is ~2.4x and ~4.2x. The old 1.8 ceiling predates
+ * that and would have put both out of reach — a summary you could no longer
+ * read without clicking it. */
+const ZOOM_MIN = 0.25, ZOOM_MAX = 6;
 
 /** Zoom about a point, keeping whatever is under it fixed. */
 function zoomAt(factor, mx, my, animate = false) {
