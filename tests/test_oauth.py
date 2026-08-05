@@ -16,6 +16,8 @@ from cryptography.hazmat.primitives.asymmetric import rsa
 
 import http_app
 import oauth
+import server
+from conftest import add_member
 from test_http import PROJECTS, Server, call, run  # noqa: F401
 
 ISSUER = "https://tenant.us.auth0.com/"
@@ -305,9 +307,16 @@ class TestOverHttp:
         assert "/.well-known/oauth-protected-resource/p/decision-tree/mcp" in challenge
 
     def test_valid_jwt_reaches_the_tools(self, vault, keypair):
+        # Authentication and authorisation are separate layers: the token has
+        # to get past the first, and membership is what gets it past the second.
+        add_member("decision-tree", "user@example.com", "owner")
+
         async def scenario():
             async with Server(self._app(keypair)) as srv:
-                token = make_token(keypair, aud=srv.url("decision-tree"))
+                token = make_token(
+                    keypair, aud=srv.url("decision-tree"),
+                    **{server.EMAIL_CLAIM: "user@example.com"},
+                )
                 return await call(
                     srv.url("decision-tree"),
                     "get_project_brief",

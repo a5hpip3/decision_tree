@@ -19,6 +19,26 @@ sys.path.insert(0, str(_ROOT / "web"))
 import server  # noqa: E402
 
 
+def add_member(project: str, email: str, role: str = "member") -> None:
+    """Put someone on a hosted project, as an owner's invite eventually will.
+
+    Also brings the vault into being, since connect() creates the file — which
+    is what a test needs when a pinned connector no longer creates projects.
+    """
+    from contextlib import closing
+
+    token = server.REMOTE_PROJECT.set(project)
+    try:
+        with closing(server.connect()) as conn, server.writing(conn):
+            conn.execute(
+                "INSERT INTO members (subject, email, role, added_at, added_by)"
+                " VALUES (NULL, ?, ?, ?, 'test')",
+                (email, role, "2026-01-01T00:00:00+00:00"),
+            )
+    finally:
+        server.REMOTE_PROJECT.reset(token)
+
+
 def unwrap(tool):
     """The plain callable behind an @mcp.tool()-decorated function.
 

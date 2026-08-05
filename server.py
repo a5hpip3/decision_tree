@@ -85,6 +85,14 @@ CREATE TABLE IF NOT EXISTS members (
 
 ROLES = ("owner", "member", "viewer")
 
+# What each role can reach. Superseding is deliberately not an owner-only act:
+# replacing a decision is how a team's thinking moves on, and needing
+# permission to do it would push people back into arguing in chat. Retiring
+# says a decision should never have been recorded at all, which on somebody
+# else's entry is an owner's call.
+RANK = {"viewer": 1, "member": 2, "owner": 3}
+NEEDS = {"read": 1, "write": 2, "admin": 3}
+
 # Columns added after the first release. CREATE TABLE IF NOT EXISTS silently
 # leaves an existing table alone, so they have to be added explicitly.
 ADDED_COLUMNS = (
@@ -207,10 +215,10 @@ def remote_projects() -> list[str]:
     )
 
 
-def project_activity() -> list[tuple[str, int]]:
-    """(name, active count) for every hosted vault."""
+def project_activity(names: list[str] | None = None) -> list[tuple[str, int]]:
+    """(name, active count) for the given hosted vaults, or every one."""
     out = []
-    for name in remote_projects():
+    for name in (remote_projects() if names is None else names):
         token = REMOTE_PROJECT.set(name)
         try:
             with closing(connect()) as conn:
@@ -229,7 +237,7 @@ def suggest_projects() -> str:
     accident, and listing them all crowds out the projects someone actually
     means — this text is read by an agent choosing where to write.
     """
-    activity = project_activity()
+    activity = project_activity(visible_projects())
     named = [name for name, active in activity if active]
     empty = len(activity) - len(named)
     if not named:
@@ -241,13 +249,17 @@ def suggest_projects() -> str:
 
 
 @contextmanager
-def scoped(project: str = "", create: bool = False):
+def scoped(project: str = "", create: bool = False, need: str = "read"):
     """Bind the vault this call should act on; yields an error string or None.
 
     Over stdio and on a pinned connector the project is already decided, and an
     explicit one is refused rather than honoured — silently writing somewhere
     other than the URL says is the misfiling this design exists to prevent.
     On the router the project is required, because nothing else supplies it.
+
+    This is also where access is decided, because it is the one path every tool
+    goes through: a check somewhere else is a check a new tool can forget.
+    `need` is what the tool is about to do — see NEEDS.
     """
     pinned = REMOTE_PROJECT.get()
 
@@ -261,7 +273,7 @@ def scoped(project: str = "", create: bool = False):
                 "or connect to the router endpoint (/mcp) to choose a project per call."
             )
         else:
-            yield None
+            yield authorise(need)
         return
 
     if not project:
@@ -276,7 +288,8 @@ def scoped(project: str = "", create: bool = False):
         yield f"Error: {project!r} is not a valid project name ({PROJECT_NAME.pattern})."
         return
 
-    if project not in remote_projects() and not create:
+    fresh = project not in remote_projects()
+    if fresh and not create:
         yield (
             f"Error: no project named {project!r}. Known projects: "
             f"{suggest_projects()}. Pass create=true to start a new one — but "
@@ -286,9 +299,167 @@ def scoped(project: str = "", create: bool = False):
 
     token = REMOTE_PROJECT.set(project)
     try:
-        yield None
+        if fresh:
+            claim_new_project()
+        yield authorise(need)
     finally:
         REMOTE_PROJECT.reset(token)
+
+
+def claim_membership(conn: sqlite3.Connection, identity: "Identity") -> str | None:
+    """The caller's role in the bound project, or None if they have none.
+
+    Membership can be recorded before the person has ever signed in: an owner
+    invites an address, and only the address is known at that point. The first
+    time someone arrives with a token that matches, their subject is written
+    into the row and every later call is matched on subject alone.
+
+    Matching on email and then pinning to a subject — rather than matching on
+    email every time — matters because an address can be reassigned inside a
+    company, while a subject cannot. Once a row is claimed it belongs to that
+    account and a later holder of the address does not inherit it.
+    """
+    row = conn.execute(
+        "SELECT role FROM members WHERE subject = ?", (identity.subject,)
+    ).fetchone()
+    if row:
+        return row["role"]
+    if not identity.email:
+        return None
+    # Compared lowercased rather than trusting the stored form: an address is
+    # case-insensitive in practice, and an invite typed with a capital would
+    # otherwise sit there never matching the person it was meant for.
+    row = conn.execute(
+        "SELECT id, role FROM members WHERE lower(email) = ? AND subject IS NULL",
+        (identity.email,),
+    ).fetchone()
+    if row is None:
+        return None
+    with writing(conn):
+        # Re-checked in the WHERE clause: two of this person's clients can
+        # arrive at once, and the second must not overwrite the first.
+        conn.execute(
+            "UPDATE members SET subject = ? WHERE id = ? AND subject IS NULL",
+            (identity.subject, row["id"]),
+        )
+    return row["role"]
+
+
+def add_owner(conn: sqlite3.Connection, identity: "Identity") -> None:
+    """Make the caller the owner of a project they just created."""
+    conn.execute(
+        "INSERT OR IGNORE INTO members (subject, email, role, added_at, added_by)"
+        " SELECT ?, ?, 'owner', ?, 'creator'"
+        " WHERE NOT EXISTS (SELECT 1 FROM members)",
+        (identity.subject, identity.email or None, now()),
+    )
+
+
+def claim_new_project() -> None:
+    """Give a newly created project to whoever asked for it.
+
+    Only reached through create=true on the router, which is somebody saying
+    they mean to start a project. A pinned connector deliberately does not
+    create: the name comes from a URL, so anything that auto-created would let
+    a caller find out which projects exist by seeing which ones refuse them,
+    and would keep turning typos into empty phantom projects.
+    """
+    identity = IDENTITY.get()
+    if identity is None:
+        return
+    with closing(connect()) as conn, writing(conn):
+        add_owner(conn, identity)
+
+
+def authorise(need: str) -> str | None:
+    """Whether the caller may do `need` in the bound project; None if they may.
+
+    Only hosted projects are gated. Over stdio the vault is a file in the
+    caller's own checkout, and there is no second party to protect it from.
+    """
+    if REMOTE_PROJECT.get() is None:
+        return None
+
+    identity = IDENTITY.get()
+    if identity is None:
+        # The static shared token predates membership and still opens every
+        # project. It is the one remaining way past this check and goes when
+        # the token itself does.
+        return None
+
+    if REMOTE_PROJECT.get() not in remote_projects():
+        return unknown_project(REMOTE_PROJECT.get())
+
+    with closing(connect()) as conn:
+        role = claim_membership(conn, identity)
+
+    if role is None:
+        # Deliberately the same answer as a project that does not exist. This
+        # server is multi-tenant, so confirming that a name is real to someone
+        # with no access to it leaks one project's existence to another's team.
+        return unknown_project(project_label())
+    if RANK[role] < NEEDS[need]:
+        return (
+            f"Error: you are a {role} on {project_label()!r}, which cannot "
+            f"{PERMISSION_VERB[need]}. Ask an owner to change your role."
+        )
+    return None
+
+
+def unknown_project(name: str) -> str:
+    """The one answer for 'no such project' and 'not yours' alike."""
+    return (
+        f"Error: no project named {name!r}. Known projects: {suggest_projects()}."
+    )
+
+
+PERMISSION_VERB = {
+    "read": "read it",
+    "write": "log or change decisions",
+    "admin": "retire other people's decisions or manage access",
+}
+
+
+def may_act_on(row: sqlite3.Row) -> str | None:
+    """Whether the caller may retire someone else's decision.
+
+    A member retires their own mistakes; declaring that somebody else's
+    decision should never have been recorded is an owner's call.
+    """
+    if REMOTE_PROJECT.get() is None:
+        return None
+    identity = IDENTITY.get()
+    if identity is None:
+        return None
+    with closing(connect()) as conn:
+        role = claim_membership(conn, identity)
+    if RANK[role] >= NEEDS["admin"]:
+        return None
+    if row["author"] and row["author"] == identity.label:
+        return None
+    return (
+        f"Error: decision #{row['id']} was logged by "
+        f"{row['author'] or 'someone else'}. Only an owner can retire another "
+        "person's decision — supersede it instead if it is simply out of date."
+    )
+
+
+def visible_projects() -> list[str]:
+    """Hosted projects the caller is a member of."""
+    identity = IDENTITY.get()
+    names = remote_projects()
+    if identity is None:
+        return names          # static token, as above
+    out = []
+    for name in names:
+        token = REMOTE_PROJECT.set(name)
+        try:
+            with closing(connect()) as conn:
+                if claim_membership(conn, identity) is not None:
+                    out.append(name)
+        finally:
+            REMOTE_PROJECT.reset(token)
+    return out
 
 
 def project_root() -> Path:
@@ -719,7 +890,7 @@ def log_decision(
         create: Start a project that does not exist yet. Only set this when you
             mean to; an unrecognised name is far more often a typo.
     """
-    with scoped(project, create) as problem:
+    with scoped(project, create, need="write") as problem:
         return problem or _write_decision(
             summary, reasoning, excerpt, derives_from, cluster, source, ref,
             author, created_at,
@@ -784,7 +955,7 @@ def supersede_decision(
             connector (a URL with no /p/<project>/ in it); omit it everywhere
             else. Call list_projects first if you are unsure of the name.
     """
-    with scoped(project) as problem:
+    with scoped(project, need="write") as problem:
         return problem or _supersede_decision(decision_id, summary, reasoning, excerpt, cluster, source, ref, author)
 
 
@@ -848,7 +1019,7 @@ def retire_decision(decision_id: int, reason: str, project: str = "") -> str:
             connector (a URL with no /p/<project>/ in it); omit it everywhere
             else. Call list_projects first if you are unsure of the name.
     """
-    with scoped(project) as problem:
+    with scoped(project, need="write") as problem:
         return problem or _retire_decision(decision_id, reason)
 
 
@@ -857,6 +1028,9 @@ def _retire_decision(decision_id, reason) -> str:
         row = conn.execute("SELECT * FROM decisions WHERE id = ?", (decision_id,)).fetchone()
         if row is None:
             return f"Error: no decision #{decision_id}. Use list_decisions to find the right id."
+        denied = may_act_on(row)
+        if denied:
+            return denied
         if row["retired_at"]:
             return (
                 f"Error: decision #{decision_id} was already retired "
@@ -980,7 +1154,7 @@ def list_projects() -> str:
     the project argument is a real name rather than a guess — and show the list
     to the user and ask which one if it is not obvious from the conversation.
     """
-    activity = dict(project_activity())
+    activity = dict(project_activity(visible_projects()))
     names = [name for name, active in activity.items() if active]
     empty = [name for name, active in activity.items() if not active]
     if not names:

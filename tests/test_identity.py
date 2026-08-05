@@ -19,7 +19,7 @@ from cryptography.hazmat.primitives.asymmetric import rsa
 import http_app
 import oauth
 import server
-from conftest import unwrap
+from conftest import add_member, unwrap
 from test_http import Server, run
 from test_oauth import ISSUER, make_token
 
@@ -203,6 +203,8 @@ class TestIdentityOverHttp:
         """End to end: the byline comes off the signature, not the argument."""
         from test_http import call
 
+        add_member("shared", "teammate@example.com", "owner")
+
         async def scenario():
             async with Server(self._app(keypair)) as srv:
                 token = make_token(
@@ -249,6 +251,8 @@ class TestIdentityOverHttp:
         """One request's caller must not become the next request's author."""
         from test_http import call
 
+        add_member("shared", "one@example.com", "owner")
+
         async def scenario():
             async with Server(self._app(keypair)) as srv:
                 first = make_token(
@@ -259,12 +263,18 @@ class TestIdentityOverHttp:
                     keypair, aud=srv.url("shared"), sub="auth0|two",
                     **{server.EMAIL_CLAIM: "two@example.com"},
                 )
-                for token in (first, second):
-                    await call(
-                        srv.url("shared"), "log_decision",
-                        {"summary": "d", "reasoning": "r", "excerpt": "x"},
-                        headers={"Authorization": f"Bearer {token}"},
-                    )
+                # The second caller is a teammate who has to be let in.
+                await call(
+                    srv.url("shared"), "log_decision",
+                    {"summary": "d", "reasoning": "r", "excerpt": "x"},
+                    headers={"Authorization": f"Bearer {first}"},
+                )
+                add_member("shared", "two@example.com")
+                await call(
+                    srv.url("shared"), "log_decision",
+                    {"summary": "d", "reasoning": "r", "excerpt": "x"},
+                    headers={"Authorization": f"Bearer {second}"},
+                )
                 headers = {"Authorization": f"Bearer {second}"}
                 return [
                     await call(srv.url("shared"), "get_decision", {"decision_id": i},
@@ -285,6 +295,8 @@ class TestIdentityOverHttp:
         would sign this decision with somebody who had nothing to do with it.
         """
         from test_http import call
+
+        add_member("shared", "one@example.com", "owner")
 
         async def scenario():
             async with Server(self._app(keypair, token="s3cret")) as srv:
