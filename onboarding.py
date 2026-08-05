@@ -62,13 +62,16 @@ def normalise_host(raw: str) -> str:
 def hosted_entry(base: str, project: str) -> dict:
     """The .mcp.json entry for this project's hosted vault.
 
-    The token is written as a ${VAR} reference, never inlined — .mcp.json is
-    meant to be committed, and Claude Code expands the variable at load time.
+    No Authorization header. It used to carry a ${VAR} reference to a token
+    shared by everyone, which is what made the vault single-user: one secret
+    that opened every project, attributable to nobody and revocable only for
+    all. Without a header the client discovers OAuth through the server's
+    protected-resource metadata and signs the person in, which is what puts
+    their name on the decisions they log.
     """
     return {
         "type": "http",
         "url": f"{base}/p/{project}/mcp",
-        "headers": {"Authorization": f"Bearer ${{{TOKEN_ENV}}}"},
     }
 
 

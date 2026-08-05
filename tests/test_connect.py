@@ -41,14 +41,24 @@ class TestConnectHosted:
         entry = config["mcpServers"]["decisiontree"]
         assert entry["type"] == "http"
         assert entry["url"] == f"{HOST}/p/my_repo/mcp"
-        assert entry["headers"]["Authorization"] == "Bearer ${CONTEXT_VAULT_TOKEN}"
+        # No credential in the file: the client discovers OAuth from the
+        # server and signs the person in, so the decisions carry their name.
+        assert "headers" not in entry
 
-    def test_never_inlines_a_real_token(self, vault, monkeypatch):
-        """The file is meant to be committed."""
+    def test_carries_no_credential_at_all(self, vault, monkeypatch):
+        """The file is meant to be committed, and now has nothing to leak.
+
+        A shared token was the thing that made the vault single-user: one
+        secret opening every project, attributable to nobody, revocable only
+        for everyone at once.
+        """
         root = vault.enter(vault.project())
         monkeypatch.setenv(onboarding.TOKEN_ENV, "super-secret-value")
         connect_hosted(host=HOST)
-        assert "super-secret-value" not in (root / ".mcp.json").read_text()
+        written = (root / ".mcp.json").read_text()
+        assert "super-secret-value" not in written
+        assert "Authorization" not in written
+        assert onboarding.TOKEN_ENV not in written
 
     def test_uses_the_declared_project_name(self, vault):
         root = vault.enter(vault.project("ugly_dir"))
