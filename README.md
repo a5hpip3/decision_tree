@@ -75,13 +75,14 @@ it never names it. You add a connector per project instead.
 
 ```bash
 pip install -r requirements.txt
-CONTEXT_VAULT_TOKEN=$(openssl rand -hex 32) python http_app.py   # :8000
+python http_app.py   # :8000, unauthenticated — local runs only
 ```
 
 | Env var | Purpose |
 |---|---|
 | `CONTEXT_VAULT_HOME` | Where vaults live (set to the mounted volume in production) |
-| `CONTEXT_VAULT_TOKEN` | Bearer token required on `/p/...`; unset means **no auth** |
+| `CONTEXT_VAULT_OAUTH_ISSUER` | Auth0 tenant URL. Setting it turns auth on; unset means **no auth**, for local runs only |
+| `CONTEXT_VAULT_OWNER_EMAIL` | Bootstrap owner for a vault with no members yet |
 | `CONTEXT_VAULT_ALLOWED_HOSTS` | Hostnames this is served on, comma-separated; `*` disables the check |
 | `PORT` / `HOST` | Listen address (default `0.0.0.0:8000`) |
 
@@ -103,7 +104,8 @@ ever runs on more than one replica.
 ```bash
 railway init --name context-vault
 railway add --service context-vault \
-  --variables "CONTEXT_VAULT_TOKEN=$(openssl rand -hex 32)" \
+  --variables "CONTEXT_VAULT_OAUTH_ISSUER=https://<tenant>.us.auth0.com/" \
+  --variables "CONTEXT_VAULT_OWNER_EMAIL=you@example.com" \
   --variables "CONTEXT_VAULT_HOME=/data"
 railway service link context-vault
 railway volume add --mount-path /data     # required — without it, redeploys wipe history
@@ -145,71 +147,114 @@ suggestions with them makes a wrong choice more likely.
 
 ### OAuth with Auth0
 
-Context Vault never issues tokens. It is a *protected resource*: Auth0 is the
-authorization server, and this server verifies the JWTs Auth0 mints.
+The vault never issues tokens. It is a *protected resource*: Auth0 is the
+authorization server, and this server verifies the JWTs Auth0 mints. There is no
+shared-secret alternative — one token opening every project cannot say who is
+calling, so nothing done with it can be attributed and revoking one holder
+revokes all of them.
 
 | Env var | Purpose |
 |---|---|
 | `CONTEXT_VAULT_OAUTH_ISSUER` | Auth0 tenant URL, e.g. `https://you.us.auth0.com/`. Setting it turns OAuth on |
-| `CONTEXT_VAULT_OAUTH_AUDIENCE` | Pin the expected `aud`. Leave unset to require the per-project URL |
+| `CONTEXT_VAULT_OAUTH_AUDIENCE` | Pin one expected `aud`. Normally unset — see the resource identifier below |
 | `CONTEXT_VAULT_OAUTH_SCOPES` | Space-separated scopes every token must carry |
+| `CONTEXT_VAULT_OWNER_EMAIL` | Bootstrap owner for a vault that has no members yet |
 
 With OAuth on, the server:
 
-- serves RFC 9728 metadata at `/.well-known/oauth-protected-resource/p/<project>/mcp`,
-  whose `resource` is the exact URL the user entered (Claude rejects it otherwise)
+- serves RFC 9728 metadata at `/.well-known/oauth-protected-resource/...`
 - answers unauthenticated calls with `401` +
-  `WWW-Authenticate: Bearer resource_metadata="…"`, pointing straight at that
-  document so the client doesn't have to probe for it
-- verifies RS256 signatures against the tenant JWKS, checking `iss`, `aud`,
+  `WWW-Authenticate: Bearer resource_metadata="…"`, pointing at that document
+- verifies RS256 signatures against the tenant JWKS, checking `iss`, `aud` and
   `exp`, and requiring `exp`/`iat`/`iss`/`aud` to be present
+- binds the verified identity for the request, so `author` comes off the token
+  and membership decides which projects the caller can reach
 
-`CONTEXT_VAULT_TOKEN` still works alongside it — either credential is accepted,
-so Claude Code can keep using the static token while claude.ai uses OAuth.
+#### One resource identifier for the whole server
+
+Every endpoint advertises the **origin** — `https://<host>` — as its resource,
+never a per-project URL. Two specs push in opposite directions here and the
+origin is the only value satisfying both:
+
+- **RFC 8707** makes the resource an audience the authorization server must
+  already recognise, and Auth0 wants each registered as an API. A URL per
+  project would mean an Auth0 API per project — which a teammate starting a
+  project cannot register in someone else's tenant.
+- **RFC 9728** has the client check the advertised value against where it
+  connected. The MCP SDK accepts the exact URL or its origin and nothing else,
+  so a shared identifier with a path on it is refused before a flow starts.
+
+The per-project audience used to be the access control. Membership is now, per
+project, on every call — so scoping the audience as well bought isolation that
+already existed. Tokens naming an older identifier (`/mcp`, or a per-project
+URL) are still accepted so a deploy never signs anyone out mid-session.
 
 #### Auth0 tenant setup
 
-1. **Settings → Advanced**: enable **Resource Parameter Compatibility Profile**.
-   Auth0 natively uses an `audience` parameter, while MCP clients send RFC 8707
-   `resource`; without this profile Auth0 ignores it and the audience is wrong.
-   Enable **Include Issuer in Authorization Responses** too.
-2. **Applications → APIs → Create API** with the identifier set to the connector
-   URL, e.g. `https://<host>/p/decision-tree/mcp`. Signing algorithm RS256.
-3. **Applications → Create Application**, type *Native* or *SPA* (a public
-   client, so PKCE and no secret). Add the callback URL
-   `https://claude.ai/api/mcp/auth_callback`. Copy the Client ID.
-4. In Claude's **Add custom connector** dialog, paste that Client ID into
-   **OAuth Client ID** and leave the secret empty.
+One-time, for the whole server:
 
-> **One API per project, or one for all?** Auth0's docs don't state whether the
-> `resource` URI is matched to an API identifier exactly or by prefix, and it
-> decides the answer. If the match is exact you need one Auth0 API per connector
-> URL — leave `CONTEXT_VAULT_OAUTH_AUDIENCE` unset and the per-project URL is
-> required as the audience. If one API can cover every project, set
-> `CONTEXT_VAULT_OAUTH_AUDIENCE` to that identifier instead. Set up the first
-> project and connect it; which case you're in becomes obvious immediately.
+1. **Settings → Advanced** — enable **Resource Parameter Compatibility Profile**
+   (Auth0 natively uses `audience`, MCP clients send RFC 8707 `resource`),
+   **Include Issuer in Authorization Responses**, and **Client ID Metadata
+   Document (CIMD) Registration**.
+2. **Applications → APIs → Create API**, identifier
+   `https://<host>/` — **with the trailing slash**. A client serialises the
+   advertised origin as a URL, which appends the slash, and Auth0 matches
+   identifiers exactly. The bare origin is rejected as malformed. Signing
+   algorithm RS256.
+3. **Applications → APIs → that API → Settings → Default Permissions for
+   Third-Party Applications** — set **User-Delegated Access** to **All** and
+   leave **Client Access** as **Unauthorized**. Every CIMD client is registered
+   third-party (`tpc_` client ids) and third-party clients get no API access
+   implicitly. Setting the tenant default covers every client at once; per-client
+   grants are Management API only.
+4. **Actions → Library → Create Custom Action**, trigger *Login / Post Login*:
 
-### Auth and claude.ai connectors
+   ```js
+   exports.onExecutePostLogin = async (event, api) => {
+     if (!event.user.email) return;
+     api.accessToken.setCustomClaim('https://decisiontree/email', event.user.email);
+   };
+   ```
 
-Anthropic supports several [connector auth types](https://claude.com/docs/connectors/building/authentication).
-This server targets two of them, and OAuth is **not** required:
+   Deploy it, then drag it into **Actions → Triggers → post-login** and Apply.
+   Deploying alone does nothing. It must be `api.accessToken`, not `api.idToken`:
+   the vault verifies the access token, and an Auth0 access token otherwise
+   carries only `sub`/`aud`/`iss`/`scope`.
 
-| Mode | How | Status |
-|---|---|---|
-| `none` | leave `CONTEXT_VAULT_TOKEN` unset | supported; anyone with the URL can read and write the vault |
-| `static_headers` | set `CONTEXT_VAULT_TOKEN`, admin enters `Authorization: Bearer <token>` when adding the connector | beta |
+### Adding a new MCP client
 
-OAuth (`oauth_dcr` / `oauth_cimd`) is not implemented. It would be the right
-move for a multi-user deployment, since `static_headers` shares one credential
-across the whole organization rather than identifying individual users.
+To connect a client the tenant has not seen before — Codex, a teammate's tool,
+a second Claude surface. All of it is Auth0 configuration; nothing changes here.
 
-The `401` response deliberately omits `WWW-Authenticate`. Claude treats `401` +
-`WWW-Authenticate: Bearer` as an OAuth challenge and starts hunting for
-protected-resource metadata, so including it turns a simple bad-token error into
-a misleading "Couldn't reach the MCP server".
+1. Find the client's **CIMD metadata URL**. Claude Code uses
+   `https://claude.ai/oauth/claude-code-client-metadata`; claude.ai chat uses
+   `https://claude.ai/oauth/mcp-oauth-client-metadata`.
+2. **Applications → Applications → Create Application → Import from URL**, paste
+   it, **Preview**, **Create**. Auth0 does *not* resolve CIMD documents on
+   demand — each client is registered once and stored.
+3. Nothing else. The API from step 2 above and the third-party default from step
+   3 already cover it.
 
-Never put the token in the URL — Anthropic's docs and the MCP spec both
-prohibit credentials in query strings, and this server never reads one.
+On the client side the config must carry **no `Authorization` header**. A static
+header makes the client skip OAuth discovery entirely:
+
+```json
+{"mcpServers": {"decisiontree": {
+  "type": "http",
+  "url": "https://<host>/p/<project>/mcp"
+}}}
+```
+
+Each error names exactly which step is missing:
+
+| Error | Missing step |
+|---|---|
+| `OAuth fallback is disabled when headers.Authorization is set` | Remove the `Authorization` header from the client config |
+| `Unknown client: <metadata url>` | Import the client's CIMD document (step 2) |
+| `Service not found: <resource>` | The API identifier is missing or spelled without the trailing slash |
+| `Protected resource X does not match expected Y (or origin)` | The server is advertising something other than the origin — a bug here, not config |
+| `Client "tpc_…" is not authorized to access resource server` | Third-party default permissions (step 3) |
 
 ## Onboarding
 
@@ -253,24 +298,21 @@ writes `.mcp.json` at the repo root:
   "mcpServers": {
     "decisiontree": {
       "type": "http",
-      "url": "https://<your-host>/p/<project>/mcp",
-      "headers": { "Authorization": "Bearer ${CONTEXT_VAULT_TOKEN}" }
+      "url": "https://<your-host>/p/<project>/mcp"
     }
   }
 }
 ```
 
-The token is a `${VAR}` reference, not a literal — Claude Code expands it at
-load time, so **the file is safe to commit** and teammates get the server when
-they open the repo. Export `CONTEXT_VAULT_TOKEN` once in your shell profile.
+There is **no credential in the file**, so it is safe to commit and teammates
+get the server when they open the repo — each of them signs in as themselves.
 
-**Export the token before connecting.** Claude Code expands `${VAR}` from its
-own environment; if the variable is unset it loads the config anyway and sends
-the literal text `Bearer ${CONTEXT_VAULT_TOKEN}`. The server detects that and
-says so by name rather than failing as an unparseable JWT. Note that a
-GUI-launched app does not read your shell profile — launch the client from a
-shell where the variable is set, or use `claude mcp add -s local` with the
-literal token instead (stored in `~/.claude.json`, never committed).
+**An `Authorization` header here breaks authentication rather than providing
+it.** The client treats a configured header as the credential and never
+attempts OAuth discovery, failing with a 401 it cannot recover from. If a repo
+still carries one from an older setup, delete the `headers` block; the server
+also detects an unexpanded `Bearer ${VAR}` and says so by name rather than
+failing as an unparseable JWT.
 
 Existing servers and unrelated keys in an existing `.mcp.json` are preserved,
 re-running is idempotent, and a malformed file is left untouched rather than
@@ -415,9 +457,10 @@ vaults are keyed to somebody's laptop and never exposed. An unknown project
 name returns `404` **without creating a vault**, which matters because opening
 one would otherwise conjure an empty project for every typo'd URL.
 
-Auth reuses `CONTEXT_VAULT_TOKEN`. A JWT is accepted only when a single fixed
-`CONTEXT_VAULT_OAUTH_AUDIENCE` is configured, since these routes are
-cross-project and have no per-project resource URL to check an audience
+Auth is the same JWT the MCP tools take, checked against the same origin
+audience, and the caller's membership decides which projects appear — so a page
+view and a tool call answer to one rule rather than two that can drift. These
+routes are cross-project and have no per-project resource URL to check an audience
 against.
 
 ## Web front-end (`web/`)
@@ -429,28 +472,34 @@ holds no data — it reads the vault through the [read API](#read-api).
 browser --session cookie--> decisiontree-web --bearer token--> vault API
 ```
 
-The vault token lives only in the web service. It is never sent to the browser,
-never embedded in a page, and the proxy forwards only `GET` to two fixed path
-shapes — an open proxy carrying a credential would be worse than no auth at all.
+This service holds **no credential of its own**. At sign-in it asks Auth0 for an
+access token scoped to the vault, keeps it in the session, and forwards that —
+so the vault applies the same membership to a page view as to a tool call.
+Deciding access here instead would mean a second rule to keep in step with the
+first, and the first time they disagreed one of them would be wrong.
+
+The proxy still forwards only `GET` to two fixed path shapes: a general proxy
+that attaches somebody's bearer token is worth attacking.
 
 | Env var | Purpose |
 |---|---|
 | `AUTH0_ISSUER` | e.g. `https://decisiontree.us.auth0.com/` |
 | `AUTH0_CLIENT_ID` / `AUTH0_CLIENT_SECRET` | a **Regular Web Application** in Auth0 (confidential client) |
-| `VAULT_API_URL` | the vault service's base URL |
-| `VAULT_API_TOKEN` | `CONTEXT_VAULT_TOKEN` from the vault service |
-| `SESSION_SECRET` | signs session cookies |
-| `WEB_ALLOWED_EMAILS` | comma-separated addresses permitted to sign in |
+| `VAULT_API_URL` | the vault service's base URL; the audience requested is this + `/mcp` |
+| `SESSION_SECRET` | signs session cookies, and derives the key the vault token is sealed with |
 | `SESSION_INSECURE_COOKIE` | `true` only for local http development |
 
-**`WEB_ALLOWED_EMAILS` fails closed.** With it unset, every sign-in is refused.
-An Auth0 tenant will happily let a stranger sign up through a social
-connection, and what is behind this door is decision reasoning and verbatim
-transcript excerpts. A refused login reports the address it refused, so a wrong
-account is distinguishable from a missing allowlist entry.
+Anyone in the tenant may hold a session here. Whether they see a project is the
+vault's answer, per project, from the membership table — a stranger signs in
+successfully and sees nothing.
 
-Sessions are signed, not encrypted — the browser can read the payload — so the
-session holds identity only and is tested to contain no credential.
+**Sessions are signed, not encrypted** — the browser can read the payload — so
+the forwarded token is encrypted before it goes in, under a key derived from
+`SESSION_SECRET`. In clear it would be a bearer credential readable by anything
+that can read the cookie, usable directly against the vault outside this
+proxy's path allowlist and for the token's whole lifetime. Rotating
+`SESSION_SECRET` invalidates sealed tokens, which sends people back through
+Auth0 — the behaviour you want from rotating a session secret anyway.
 
 Auth0 needs the callback URL `https://<web-host>/auth/callback` registered on
 that application.
