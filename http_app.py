@@ -118,27 +118,41 @@ def request_origin(scope) -> str:
 
 
 def canonical_resource(scope) -> str:
-    """The one resource identifier every endpoint advertises.
+    """The one resource identifier every endpoint advertises: the origin.
+
+    Two rules have to hold at once, and only this satisfies both.
 
     RFC 8707 makes the resource an audience the authorization server has to
-    recognise, and Auth0 wants each one registered as an API. Advertising a
-    URL per project therefore meant a tenant admin registering an API every
-    time somebody started a project — which a teammate creating one cannot do,
-    and which fails with "Service not found" until they have.
+    already recognise, and Auth0 wants each registered as an API. A URL per
+    project therefore meant an API per project — which a teammate starting one
+    cannot register in someone else's tenant, and which fails outright with
+    "Service not found" until an admin does.
 
-    One identifier for the whole server instead. The per-project audience used
-    to be the access control, back when holding a token was the same as being
-    allowed in; membership decides that now, per project, so scoping the
-    audience as well bought isolation that was already there.
+    RFC 9728 then has the client check what is advertised against where it
+    connected. The MCP SDK accepts the exact URL or its origin, and nothing
+    else — so a shared identifier with any path on it is refused by the client
+    even when the authorization server is happy with it.
+
+    The origin is the only value that is both shared across every project and
+    acceptable to a client connecting to one. One API to register, once.
+
+    The per-project audience was load-bearing when holding a token was the same
+    as being allowed in — it was what kept a token for one project out of
+    another. Membership does that now, on every call, so scoping the audience
+    as well was buying isolation that already existed.
     """
-    return f"{request_origin(scope)}{ROUTER_PATH}"
+    return request_origin(scope)
 
 
 def acceptable_resources(scope, project) -> list:
-    """Audiences a token may name. The canonical one, and — for a pinned
-    endpoint — the URL it used to advertise, so tokens already issued against
-    it keep working."""
-    urls = [canonical_resource(scope)]
+    """Audiences a token may name.
+
+    The canonical one, plus the two this server advertised before it: tokens
+    already issued against those keep working rather than everybody being
+    signed out by a deploy.
+    """
+    origin = request_origin(scope)
+    urls = [origin, f"{origin}{ROUTER_PATH}"]
     if project is not None:
         urls.append(resource_url_for(scope, project))
     return urls
@@ -375,7 +389,7 @@ async def _api_authorized(scope, oauth_config, verifier):
     placeholder = unexpanded_variable(presented)
     if placeholder:
         return placeholder_reason(placeholder), None
-    expected = canonical_resource(scope)
+    expected = acceptable_resources(scope, None)
     try:
         claims = await verifier.verify(presented, expected)
     except oauth.AuthError as exc:

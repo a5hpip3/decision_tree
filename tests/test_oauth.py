@@ -276,13 +276,14 @@ class TestOverHttp:
         )
 
     def test_every_endpoint_advertises_one_resource(self, vault, keypair):
-        """The client sends this back as `resource`, and RFC 8707 makes that an
-        audience the authorization server has to already know about.
+        """One identifier for the whole server, and it has to be the origin.
 
-        Advertising a URL per project meant registering an API per project —
-        which a teammate starting one cannot do, and which fails outright until
-        somebody has. One identifier for the whole server instead; membership
-        is what separates the projects.
+        The client sends this back as `resource`, and RFC 8707 makes that an
+        audience the authorization server must already know — so a URL per
+        project meant an API per project, which a teammate starting one cannot
+        register. RFC 9728 then has the client check the advertised value
+        against where it connected, and the MCP SDK accepts only the exact URL
+        or its origin. The origin is the one value that satisfies both.
         """
 
         async def scenario():
@@ -304,10 +305,34 @@ class TestOverHttp:
         base, responses = run(scenario())
         assert [r.status_code for r in responses] == [200, 200, 200, 200]
         resources = {r.json()["resource"] for r in responses}
-        assert resources == {f"{base}/mcp"}, resources
+        assert resources == {base}, resources
+        # What the SDK will accept: the exact connect URL, or its origin.
+        assert not resources.pop().endswith("/mcp")
         assert responses[0].json()["authorization_servers"] == [
             "https://tenant.us.auth0.com/"
         ]
+
+    def test_the_advertised_resource_is_what_a_client_will_accept(self, vault, keypair):
+        """The check the MCP SDK makes before it will start a flow at all.
+
+        It refused a shared identifier with a path on it: "Protected resource
+        .../mcp does not match expected .../p/hopscotch/mcp (or origin)".
+        """
+
+        async def scenario():
+            import httpx2
+
+            async with Server(self._app(keypair)) as srv:
+                base = f"http://127.0.0.1:{srv.port}"
+                async with httpx2.AsyncClient() as client:
+                    doc = await client.get(
+                        f"{base}/.well-known/oauth-protected-resource/p/hopscotch/mcp"
+                    )
+                    return base, doc.json()["resource"]
+
+        base, advertised = run(scenario())
+        connected_to = f"{base}/p/hopscotch/mcp"
+        assert advertised == connected_to or advertised == base
 
     def test_a_token_for_the_server_works_on_any_project_endpoint(self, vault, keypair):
         """One audience, and membership decides which projects it reaches.
@@ -322,7 +347,7 @@ class TestOverHttp:
             async with Server(self._app(keypair)) as srv:
                 token = make_token(
                     keypair,
-                    aud=f"http://127.0.0.1:{srv.port}/mcp",
+                    aud=f"http://127.0.0.1:{srv.port}",
                     sub="auth0|m",
                     **{server.EMAIL_CLAIM: "member@example.com"},
                 )
@@ -477,3 +502,41 @@ class TestDiagnostics:
         logged = caplog.text
         assert "wrong.example.com" in logged, "should record what the token claimed"
         assert "decision-tree" in logged, "should record what was expected"
+
+
+class TestAudiencesAlreadyIssued:
+    """A deploy must not sign everybody out.
+
+    Tokens minted against what this server advertised before — the router URL,
+    and the per-project URL before that — stay valid until they expire.
+    """
+
+    def _app(self, keypair):
+        _, public = keypair
+        stub = type("S", (), {
+            "get_signing_key_from_jwt": lambda self, t: type("K", (), {"key": public})()
+        })()
+        config = oauth.OAuthConfig(issuer=ISSUER)
+        return http_app.build_app(
+            oauth_config=config,
+            verifier=oauth.TokenVerifier(config, jwk_client=stub),
+        )
+
+    @pytest.mark.parametrize("suffix", ["", "/mcp", "/p/hopscotch/mcp"])
+    def test_previously_advertised_audiences_still_verify(self, vault, keypair, suffix):
+        add_member("hopscotch", "member@example.com", "owner")
+
+        async def scenario():
+            async with Server(self._app(keypair)) as srv:
+                token = make_token(
+                    keypair,
+                    aud=f"http://127.0.0.1:{srv.port}{suffix}",
+                    sub="auth0|m",
+                    **{server.EMAIL_CLAIM: "member@example.com"},
+                )
+                return await call(
+                    srv.url("hopscotch"), "get_project_brief",
+                    headers={"Authorization": f"Bearer {token}"},
+                )
+
+        assert "hopscotch" in run(scenario())
