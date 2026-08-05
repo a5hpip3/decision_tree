@@ -509,6 +509,11 @@ class TestAudiencesAlreadyIssued:
 
     Tokens minted against what this server advertised before — the router URL,
     and the per-project URL before that — stay valid until they expire.
+
+    The trailing-slash spelling is not history but the present: a client
+    serialises the advertised origin as a URL before sending it back, which
+    adds the slash, and the authorization server issues against whichever
+    string it was told to register.
     """
 
     def _app(self, keypair):
@@ -522,7 +527,7 @@ class TestAudiencesAlreadyIssued:
             verifier=oauth.TokenVerifier(config, jwk_client=stub),
         )
 
-    @pytest.mark.parametrize("suffix", ["", "/mcp", "/p/hopscotch/mcp"])
+    @pytest.mark.parametrize("suffix", ["", "/", "/mcp", "/p/hopscotch/mcp"])
     def test_previously_advertised_audiences_still_verify(self, vault, keypair, suffix):
         add_member("hopscotch", "member@example.com", "owner")
 

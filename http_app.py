@@ -147,12 +147,19 @@ def canonical_resource(scope) -> str:
 def acceptable_resources(scope, project) -> list:
     """Audiences a token may name.
 
-    The canonical one, plus the two this server advertised before it: tokens
-    already issued against those keep working rather than everybody being
-    signed out by a deploy.
+    Both spellings of the origin. A client turns the advertised origin into a
+    URL before sending it back, and serialising a URL with an empty path adds
+    the trailing slash — so what arrives is `https://host/` even though
+    `https://host` was advertised. Auth0 issues the token against whichever
+    string it has registered, so the audience can be either and the difference
+    is not ours to impose on anyone.
+
+    Plus the two identifiers this server advertised before: tokens already
+    issued against those keep working rather than everybody being signed out
+    by a deploy.
     """
     origin = request_origin(scope)
-    urls = [origin, f"{origin}{ROUTER_PATH}"]
+    urls = [origin, f"{origin}/", f"{origin}{ROUTER_PATH}"]
     if project is not None:
         urls.append(resource_url_for(scope, project))
     return urls
