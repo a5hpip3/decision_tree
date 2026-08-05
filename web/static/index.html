@@ -121,6 +121,9 @@
     transform:scale(1.2);
   }
   .orb.dragging { cursor:grabbing; }
+  /* Attention dimming: what is not connected to the hovered node recedes. */
+  .faded { opacity:.15 !important; }
+  .orb, .orb-label, #world svg line { transition:opacity .18s ease; }
 
   .orb-label {
     position:absolute; width:180px; text-align:center; pointer-events:none;
