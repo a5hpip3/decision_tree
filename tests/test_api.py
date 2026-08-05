@@ -14,7 +14,7 @@ import pytest
 import api
 import http_app
 import server
-from conftest import unwrap
+from conftest import add_member, api_token, oauth_app, unwrap
 from test_http import Server, run
 
 log_decision = unwrap(server.log_decision)
@@ -215,43 +215,101 @@ class TestOverHttp:
 
 
 class TestApiAuth:
+    """The API takes the signed-in person's own token, not one of its own.
+
+    The web service used to hold a shared credential and decide for itself who
+    could see what, from a separate allowlist. Forwarding the caller's token
+    means the vault applies the same membership it applies to a tool call, so
+    there is one rule rather than two that can drift apart.
+    """
+
     def _get(self, path, headers=None, **build_kw):
-        """One request against a freshly built app.
-
-        The app is rebuilt per call on purpose: it holds an MCP session
-        manager that can only be run once, so reusing one instance across two
-        uvicorn runs fails startup with SystemExit(3).
-        """
-
         async def scenario():
             import httpx2
 
-            async with Server(http_app.build_app(**build_kw)) as srv:
+            async with Server(oauth_app(**build_kw)) as srv:
                 async with httpx2.AsyncClient(headers=headers or {}) as client:
                     return await client.get(f"http://127.0.0.1:{srv.port}{path}")
 
         return run(scenario())
 
-    def test_token_required_when_configured(self, vault):
-        seed(vault, "proj", ["one"])
-        assert self._get("/api/projects", token="secret").status_code == 401
-        assert self._get("/api/projects/proj/decisions", token="secret").status_code == 401
+    def bearer(self, srv_port, **claims):
+        return {"Authorization": f"Bearer {api_token(srv_port, **claims)}"}
 
-    def test_correct_token_accepted(self, vault):
+    def test_anonymous_is_refused(self, vault):
         seed(vault, "proj", ["one"])
-        response = self._get(
-            "/api/projects", {"Authorization": "Bearer secret"}, token="secret"
-        )
-        assert response.status_code == 200
+        assert self._get("/api/projects").status_code == 401
+        assert self._get("/api/projects/proj/decisions").status_code == 401
 
-    def test_wrong_token_rejected(self, vault):
+    def test_an_opaque_secret_is_refused(self, vault):
+        seed(vault, "proj", ["one"])
         assert self._get(
-            "/api/projects", {"Authorization": "Bearer nope"}, token="secret"
+            "/api/projects", {"Authorization": "Bearer secret"}
         ).status_code == 401
 
-    def test_open_when_nothing_configured(self, vault):
+    def test_a_members_token_is_accepted(self, vault):
         seed(vault, "proj", ["one"])
-        assert self._get("/api/projects").status_code == 200
+        add_member("proj", "member@example.com", "owner")
+
+        async def scenario():
+            import httpx2
+
+            async with Server(oauth_app()) as srv:
+                token = api_token(srv.port, sub="auth0|m",
+                                  **{server.EMAIL_CLAIM: "member@example.com"})
+                async with httpx2.AsyncClient(
+                    headers={"Authorization": f"Bearer {token}"}
+                ) as client:
+                    return await client.get(
+                        f"http://127.0.0.1:{srv.port}/api/projects"
+                    )
+
+        response = run(scenario())
+        assert response.status_code == 200
+        assert [p["name"] for p in response.json()["projects"]] == ["proj"]
+
+    def test_a_token_without_a_subject_sees_nothing(self, vault):
+        """Verified, but nobody. An absent identity is not a wildcard."""
+        seed(vault, "proj", ["one"])
+        add_member("proj", "member@example.com", "owner")
+
+        async def scenario():
+            import httpx2
+
+            async with Server(oauth_app()) as srv:
+                token = api_token(srv.port, sub=None)
+                async with httpx2.AsyncClient(
+                    headers={"Authorization": f"Bearer {token}"}
+                ) as client:
+                    return await client.get(f"http://127.0.0.1:{srv.port}/api/projects")
+
+        assert run(scenario()).json()["projects"] == []
+
+    def test_a_stranger_sees_no_projects(self, vault):
+        seed(vault, "proj", ["one"])
+        add_member("proj", "member@example.com", "owner")
+
+        async def scenario():
+            import httpx2
+
+            async with Server(oauth_app()) as srv:
+                token = api_token(srv.port, sub="auth0|s",
+                                  **{server.EMAIL_CLAIM: "stranger@example.com"})
+                async with httpx2.AsyncClient(
+                    headers={"Authorization": f"Bearer {token}"}
+                ) as client:
+                    projects = await client.get(
+                        f"http://127.0.0.1:{srv.port}/api/projects"
+                    )
+                    decisions = await client.get(
+                        f"http://127.0.0.1:{srv.port}/api/projects/proj/decisions"
+                    )
+                    return projects, decisions
+
+        projects, decisions = run(scenario())
+        assert projects.json()["projects"] == []
+        # 404, not 403: a name is another team's business.
+        assert decisions.status_code == 404
 
 
 class TestLastActivity:

@@ -8,6 +8,7 @@ which project a request belongs to.
 from __future__ import annotations
 
 import asyncio
+import pathlib
 
 import pytest
 import uvicorn
@@ -16,6 +17,7 @@ from mcp.client.streamable_http import streamable_http_client
 
 import http_app
 import server
+from conftest import oauth_app
 
 PROJECTS = ["alpha", "beta", "gamma", "delta"]
 
@@ -167,6 +169,170 @@ def run(coro):
     return asyncio.run(coro)
 
 
+class TestParseProject:
+    @pytest.mark.parametrize(
+        "path,expected",
+        [
+            ("/p/alpha/mcp", "alpha"),
+            ("/p/my-repo/mcp", "my-repo"),
+            ("/p/repo.v2/mcp", "repo.v2"),
+            ("/p/a/mcp", "a"),
+            ("/p/" + "z" * 64 + "/mcp", "z" * 64),
+        ],
+    )
+    def test_accepts_valid_names(self, path, expected):
+        assert http_app.parse_project(path) == expected
+
+    @pytest.mark.parametrize(
+        "path",
+        [
+            "/p//mcp",
+            "/p/../mcp",
+            "/p/../../etc/passwd/mcp",
+            "/p/a/b/mcp",
+            "/p/UPPER/mcp",
+            "/p/-leading/mcp",
+            "/p/.hidden/mcp",
+            "/p/sp ace/mcp",
+            "/p/semi;colon/mcp",
+            "/p/" + "z" * 65 + "/mcp",
+            "/p/alpha",
+            "/p/alpha/sse",
+            "/mcp",
+            "/",
+        ],
+    )
+    def test_rejects_everything_else(self, path):
+        assert http_app.parse_project(path) is None
+
+    def test_traversal_cannot_escape_the_vault_directory(self, vault):
+        """A rejected name must never reach db_path()."""
+        assert http_app.parse_project("/p/../../etc/passwd/mcp") is None
+
+    def test_valid_names_stay_inside_the_vault_directory(self, vault):
+        token = server.REMOTE_PROJECT.set("alpha")
+        try:
+            path = server.db_path().resolve()
+        finally:
+            server.REMOTE_PROJECT.reset(token)
+        assert path.parent == (vault.home / "remote").resolve()
+
+
+# --------------------------------------------------------------------------
+# Storage routing via the contextvar
+# --------------------------------------------------------------------------
+
+
+class TestRemoteStorage:
+    def test_remote_project_selects_its_own_file(self, vault):
+        paths = []
+        for name in ("alpha", "beta"):
+            token = server.REMOTE_PROJECT.set(name)
+            try:
+                paths.append(server.db_path())
+            finally:
+                server.REMOTE_PROJECT.reset(token)
+        assert paths[0] != paths[1]
+        assert {p.name for p in paths} == {"alpha.db", "beta.db"}
+
+    def test_remote_outranks_pinned_db_env(self, vault, monkeypatch, tmp_path):
+        """Otherwise one env var would collapse every tenant into one vault."""
+        monkeypatch.setenv("CONTEXT_VAULT_DB", str(tmp_path / "pinned.db"))
+        token = server.REMOTE_PROJECT.set("alpha")
+        try:
+            assert server.db_path().name == "alpha.db"
+        finally:
+            server.REMOTE_PROJECT.reset(token)
+
+    def test_meta_records_remote_identity(self, vault):
+        token = server.REMOTE_PROJECT.set("alpha")
+        try:
+            assert server.project_identity() == "remote:alpha"
+            assert server.project_label() == "alpha"
+        finally:
+            server.REMOTE_PROJECT.reset(token)
+
+    def test_local_mode_is_unchanged(self, vault):
+        """The contextvar being unset must leave stdio behaviour intact."""
+        repo = vault.enter(vault.project("repo"))
+        assert server.REMOTE_PROJECT.get() is None
+        assert server.db_path().parent == vault.home / "projects"
+        assert server.project_identity() == str(repo)
+
+    def test_legacy_hint_suppressed_for_remote_clients(self, vault):
+        vault.create_legacy()
+        token = server.REMOTE_PROJECT.set("alpha")
+        try:
+            assert server.empty_vault_note() == ""
+        finally:
+            server.REMOTE_PROJECT.reset(token)
+
+
+# --------------------------------------------------------------------------
+# End-to-end over real HTTP
+# --------------------------------------------------------------------------
+
+
+class Server:
+    """A uvicorn instance on an ephemeral port, for the duration of a test."""
+
+    def __init__(self, app):
+        config = uvicorn.Config(app, host="127.0.0.1", port=0, log_level="critical")
+        self._server = uvicorn.Server(config)
+        self._task: asyncio.Task | None = None
+
+    async def __aenter__(self):
+        self._task = asyncio.create_task(self._server.serve())
+        while not self._server.started:
+            await asyncio.sleep(0.02)
+        self.port = self._server.servers[0].sockets[0].getsockname()[1]
+        return self
+
+    async def __aexit__(self, *exc):
+        self._server.should_exit = True
+        await self._task
+
+    def url(self, project: str) -> str:
+        return f"http://127.0.0.1:{self.port}/p/{project}/mcp"
+
+
+async def call(url: str, tool: str, args: dict | None = None, headers=None) -> str:
+    import httpx2
+
+    client = httpx2.AsyncClient(headers=headers) if headers else None
+    async with streamable_http_client(url, http_client=client) as streams:
+        async with ClientSession(streams[0], streams[1]) as session:
+            await session.initialize()
+            result = await session.call_tool(tool, args or {})
+            return result.content[0].text
+
+
+def run(coro):
+    return asyncio.run(coro)
+
+
+def oauth_app(**kw):
+    """An app that verifies credentials, with the network fetch stubbed out.
+
+    Tests that used to configure a shared secret need a server that refuses
+    anonymous callers; the only such server now is one with an issuer.
+    """
+    from cryptography.hazmat.primitives.asymmetric import rsa
+
+    import oauth
+
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    stub = type("S", (), {
+        "get_signing_key_from_jwt": lambda self, t: type("K", (), {"key": key.public_key()})()
+    })()
+    config = oauth.OAuthConfig(issuer="https://tenant.us.auth0.com/")
+    return http_app.build_app(
+        oauth_config=config,
+        verifier=oauth.TokenVerifier(config, jwk_client=stub),
+        **kw,
+    )
+
+
 class TestOverHttp:
     def test_decision_logged_via_url_lands_in_that_project(self, vault):
         async def scenario():
@@ -250,7 +416,7 @@ class TestOverHttp:
         async def scenario():
             import httpx2
 
-            async with Server(http_app.build_app(token="secret")) as srv:
+            async with Server(oauth_app()) as srv:
                 base = f"http://127.0.0.1:{srv.port}"
                 async with httpx2.AsyncClient() as client:
                     health = await client.get(f"{base}/healthz")
@@ -319,52 +485,55 @@ class TestTransportSecurity:
         assert run(scenario()).status_code == 421
 
 
-class TestAuth:
-    def test_missing_token_is_rejected(self, vault):
+class TestNoSharedSecret:
+    """There is no way in but as somebody.
+
+    A single token opening every project cannot say who is calling, so nothing
+    done with it can be attributed and revoking one holder revokes all of
+    them. That is what kept the vault single-user, and it is gone: build_app
+    takes no token at all, and the only credential is a JWT identifying a
+    person.
+    """
+
+    def test_build_app_takes_no_token(self):
+        import inspect
+
+        assert "token" not in inspect.signature(http_app.build_app).parameters
+
+    def test_the_old_shared_secret_is_not_read_from_the_environment(self, monkeypatch):
+        import importlib
+
+        monkeypatch.setenv("CONTEXT_VAULT_TOKEN", "secret")
+        importlib.reload(http_app)
+        assert "CONTEXT_VAULT_TOKEN" not in pathlib.Path(http_app.__file__).read_text()
+
+    def test_an_unauthenticated_call_is_refused(self, vault):
         async def scenario():
             import httpx2
 
-            async with Server(http_app.build_app(token="secret")) as srv:
+            async with Server(oauth_app()) as srv:
                 async with httpx2.AsyncClient() as client:
                     return await client.post(srv.url("alpha"), json={})
 
         response = run(scenario())
         assert response.status_code == 401
-        # No WWW-Authenticate: Claude would read it as an OAuth challenge and
-        # fail with "Couldn't reach the MCP server" instead of an auth error.
-        assert "www-authenticate" not in response.headers
+        # An OAuth challenge now, because obtaining a token is the way in.
+        assert "www-authenticate" in response.headers
 
-    def test_wrong_token_is_rejected(self, vault):
+    def test_an_opaque_secret_is_refused(self, vault):
+        """Whatever the old token was, it is not a credential any more."""
+
         async def scenario():
             import httpx2
 
-            async with Server(http_app.build_app(token="secret")) as srv:
+            async with Server(oauth_app()) as srv:
                 async with httpx2.AsyncClient() as client:
                     return await client.post(
-                        srv.url("alpha"),
-                        json={},
-                        headers={"Authorization": "Bearer wrong"},
+                        srv.url("alpha"), json={},
+                        headers={"Authorization": "Bearer secret"},
                     )
 
         assert run(scenario()).status_code == 401
-
-    def test_correct_token_is_accepted(self, vault):
-        async def scenario():
-            async with Server(http_app.build_app(token="secret")) as srv:
-                return await call(
-                    srv.url("alpha"),
-                    "get_project_brief",
-                    headers={"Authorization": "Bearer secret"},
-                )
-
-        assert "no recorded history" in run(scenario())
-
-    def test_no_token_configured_means_open(self, vault):
-        async def scenario():
-            async with Server(http_app.build_app(token=None)) as srv:
-                return await call(srv.url("alpha"), "get_project_brief")
-
-        assert "no recorded history" in run(scenario())
 
 
 class TestUnexpandedCredential:
@@ -384,7 +553,7 @@ class TestUnexpandedCredential:
         async def scenario():
             import httpx2
 
-            async with Server(http_app.build_app(token="secret")) as srv:
+            async with Server(oauth_app()) as srv:
                 async with httpx2.AsyncClient() as client:
                     return await client.post(
                         srv.url("alpha"),

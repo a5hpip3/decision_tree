@@ -20,7 +20,7 @@ import http_app
 import oauth
 import server
 from conftest import add_member, unwrap
-from test_http import Server, run
+from test_http import Server, call, run
 from test_oauth import ISSUER, make_token
 
 log_decision = unwrap(server.log_decision)
@@ -201,8 +201,6 @@ class TestIdentityOverHttp:
 
     def test_decision_is_attributed_to_the_token_holder(self, vault, keypair):
         """End to end: the byline comes off the signature, not the argument."""
-        from test_http import call
-
         add_member("shared", "teammate@example.com", "owner")
 
         async def scenario():
@@ -228,29 +226,27 @@ class TestIdentityOverHttp:
         assert "teammate@example.com" in body
         assert "someone.else@example.com" not in body
 
-    def test_static_token_carries_no_identity(self, vault, keypair):
-        """A shared secret names a machine, so it must not fabricate a person."""
-        from test_http import call
+    def test_a_token_without_a_subject_is_refused(self, vault, keypair):
+        """It verifies, but there is nobody in it to be a member of anything.
+
+        A correctly signed token for the right audience with no `sub` gets
+        past authentication and yields no identity. Reading that absence as
+        permission would be the old shared-secret hole reopened by accident.
+        """
+        add_member("shared", "someone@example.com", "owner")
 
         async def scenario():
-            async with Server(self._app(keypair, token="s3cret")) as srv:
-                headers = {"Authorization": "Bearer s3cret"}
-                await call(
-                    srv.url("shared"), "log_decision",
-                    {"summary": "Use WAL", "reasoning": "r", "excerpt": "x",
-                     "author": "Ash"},
-                    headers=headers,
-                )
+            async with Server(self._app(keypair)) as srv:
+                token = make_token(keypair, aud=srv.url("shared"), sub=None)
                 return await call(
-                    srv.url("shared"), "get_decision", {"decision_id": 1}, headers=headers
+                    srv.url("shared"), "list_decisions", {},
+                    headers={"Authorization": f"Bearer {token}"},
                 )
 
-        assert "Ash" in run(scenario())
+        assert "signed in" in run(scenario())
 
     def test_identity_does_not_leak_between_requests(self, vault, keypair):
         """One request's caller must not become the next request's author."""
-        from test_http import call
-
         add_member("shared", "one@example.com", "owner")
 
         async def scenario():
@@ -286,44 +282,6 @@ class TestIdentityOverHttp:
         assert "one@example.com" in first_body
         assert "two@example.com" not in first_body
         assert "two@example.com" in second_body
-
-    def test_identity_does_not_survive_into_an_anonymous_request(self, vault, keypair):
-        """The case a stale contextvar would actually corrupt.
-
-        Both credentials are accepted here. A static-token request carries no
-        identity, so if the previous request's identity were still bound it
-        would sign this decision with somebody who had nothing to do with it.
-        """
-        from test_http import call
-
-        add_member("shared", "one@example.com", "owner")
-
-        async def scenario():
-            async with Server(self._app(keypair, token="s3cret")) as srv:
-                token = make_token(
-                    keypair, aud=srv.url("shared"), sub="auth0|one",
-                    **{server.EMAIL_CLAIM: "one@example.com"},
-                )
-                await call(
-                    srv.url("shared"), "log_decision",
-                    {"summary": "first", "reasoning": "r", "excerpt": "x"},
-                    headers={"Authorization": f"Bearer {token}"},
-                )
-                headers = {"Authorization": "Bearer s3cret"}
-                await call(
-                    srv.url("shared"), "log_decision",
-                    {"summary": "second", "reasoning": "r", "excerpt": "x",
-                     "author": "Ash"},
-                    headers=headers,
-                )
-                return await call(
-                    srv.url("shared"), "get_decision", {"decision_id": 2}, headers=headers
-                )
-
-        body = run(scenario())
-        assert "Ash" in body
-        assert "one@example.com" not in body
-
 
 # --------------------------------------------------------------------------
 # Concurrent writes
@@ -618,8 +576,6 @@ class TestAuthDiagnostics:
         )
 
     def test_claim_names_are_logged_without_their_values(self, vault, keypair, caplog):
-        from test_http import call
-
         async def scenario():
             async with Server(self._app(keypair)) as srv:
                 token = make_token(

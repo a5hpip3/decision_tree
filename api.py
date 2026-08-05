@@ -26,7 +26,17 @@ def remote_dir() -> Path:
 
 
 def project_names() -> list[str]:
-    """Names of hosted vaults, from the filenames on the volume."""
+    """Hosted vaults the caller is a member of.
+
+    The same membership the MCP tools apply, from the same table. A second
+    rule here — an allowlist, a config flag — would be a second thing to keep
+    in step, and the first time they disagreed one of them would be wrong.
+    """
+    return [n for n in all_project_names() if n in set(server.visible_projects())]
+
+
+def all_project_names() -> list[str]:
+    """Every hosted vault on the volume, membership ignored."""
     directory = remote_dir()
     if not directory.is_dir():
         return []
@@ -41,6 +51,12 @@ def project_names() -> list[str]:
 
 
 def exists(name: str) -> bool:
+    """Whether the caller may read this project.
+
+    Deliberately conflated with existence: answering "it is there but not
+    yours" differently from "there is no such thing" lets anyone enumerate
+    every project on a multi-tenant volume.
+    """
     return bool(server.PROJECT_NAME.match(name)) and name in set(project_names())
 
 

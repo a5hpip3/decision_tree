@@ -1,13 +1,19 @@
-"""decisiontree-web — session gate, allowlist, and the credential-bearing proxy.
+"""decisiontree-web — the session gate and the token-forwarding proxy.
 
-The security property under test: the vault token lives only in this service.
-It must never reach the browser, and the proxy must not become a general
-credential-bearing tunnel into the vault API.
+The security property under test: this service holds no credential of its own
+and decides nothing about who may see what. It forwards the signed-in
+person's own token, so the vault applies the same membership to a page view
+as to a tool call. The proxy must still not become a general tunnel — it
+carries somebody's bearer token, which is worth attacking.
 """
 
 from __future__ import annotations
 
+import pathlib
+
 import pytest
+
+from starlette.responses import JSONResponse
 
 import app as web
 from test_http import Server, run
@@ -17,9 +23,7 @@ BASE_ENV = {
     "AUTH0_CLIENT_ID": "client-abc",
     "AUTH0_CLIENT_SECRET": "shh",
     "VAULT_API_URL": "https://vault.example.com",
-    "VAULT_API_TOKEN": "vault-secret-token",
     "SESSION_SECRET": "session-secret",
-    "WEB_ALLOWED_EMAILS": "ash@example.com, Other@Example.com",
     # Tests speak http, and a Secure cookie is never sent back over http.
     "SESSION_INSECURE_COOKIE": "true",
 }
@@ -42,32 +46,28 @@ class TestConfig:
         assert config(AUTH0_CLIENT_ID="").missing() == ["AUTH0_CLIENT_ID"]
         assert config().missing() == []
 
-    def test_allowlist_is_parsed_and_normalised(self):
-        assert config().allowed_emails == ("ash@example.com", "other@example.com")
+    def test_audience_is_the_vaults_router(self):
+        """One credential covers the whole read API, as it does the router."""
+        assert config().audience == "https://vault.example.com/mcp"
 
-    def test_vault_token_is_not_required_config(self):
-        """An open vault is a valid deployment; a missing session secret is not."""
-        assert "VAULT_API_TOKEN" not in config(VAULT_API_TOKEN="").missing()
+    def test_session_secret_is_required(self):
         assert "SESSION_SECRET" in config(SESSION_SECRET="").missing()
 
 
-class TestAllowlist:
-    def test_listed_address_allowed(self):
-        assert web.is_allowed("ash@example.com", config().allowed_emails)
+class TestNoLocalAllowlist:
+    """Access is not this service's decision any more.
 
-    def test_case_and_whitespace_insensitive(self):
-        assert web.is_allowed("  ASH@Example.com ", config().allowed_emails)
+    It used to keep its own list of addresses, which meant two rules for one
+    question — and the first time they disagreed, one of them was wrong.
+    """
 
-    def test_unlisted_address_refused(self):
-        assert not web.is_allowed("stranger@example.com", config().allowed_emails)
+    def test_the_allowlist_is_gone(self):
+        assert not hasattr(web, "is_allowed")
+        assert not hasattr(config(), "allowed_emails")
 
-    def test_empty_allowlist_refuses_everyone(self):
-        """Fail closed: an Auth0 tenant will let a stranger sign up."""
-        assert not web.is_allowed("ash@example.com", ())
-
-    def test_missing_email_refused(self):
-        assert not web.is_allowed(None, config().allowed_emails)
-        assert not web.is_allowed("", config().allowed_emails)
+    def test_it_holds_no_vault_credential(self):
+        assert not hasattr(config(), "vault_token")
+        assert "WEB_ALLOWED_EMAILS" not in pathlib.Path(web.__file__).read_text()
 
 
 class TestProxyPathAllowlist:
@@ -147,26 +147,33 @@ class FakeAuth0:
     the flow belongs to Authlib and is not ours to re-test.
     """
 
-    def __init__(self, claims):
+    def __init__(self, claims, access_token="vault-access-token"):
         self._claims = claims
+        self._access_token = access_token
         self.auth0 = self
 
     async def authorize_access_token(self, request):
-        return {"userinfo": self._claims}
+        token = {"userinfo": self._claims}
+        if self._access_token is not None:
+            token["access_token"] = self._access_token
+        return token
 
 
-class TestCallbackEnforcesTheAllowlist:
-    """The single most security-critical decision in this service: who gets in.
+class TestCallback:
+    """Signing in has to produce something the vault will accept.
 
-    Exercised through the real route rather than the helper, because the check
-    being present in is_allowed() says nothing about the callback calling it.
+    Proving who somebody is does not prove the vault will talk to them. A
+    session that looks valid but can read nothing is worse than a refused
+    login, because the failure surfaces later and somewhere else.
     """
 
-    def _callback(self, claims, **overrides):
+    def _callback(self, claims, access_token="vault-access-token", **overrides):
         async def scenario():
             import httpx2
 
-            application = web.build_app(config(**overrides), oauth=FakeAuth0(claims))
+            application = web.build_app(
+                config(**overrides), oauth=FakeAuth0(claims, access_token)
+            )
             async with Server(application) as srv:
                 async with httpx2.AsyncClient(follow_redirects=False) as client:
                     started = await client.get(f"http://127.0.0.1:{srv.port}/auth/callback")
@@ -178,36 +185,33 @@ class TestCallbackEnforcesTheAllowlist:
 
         return run(scenario())
 
-    def test_allowed_email_gets_a_session(self):
+    def test_sign_in_creates_a_session(self):
         started, after = self._callback({"email": "ash@example.com", "name": "Ash"})
         assert started.status_code in (302, 307)
         assert started.headers["location"].endswith("/")
-        assert after.status_code == 200
         assert after.json()["email"] == "ash@example.com"
 
-    def test_stranger_is_refused_and_gets_no_session(self):
+    def test_no_access_token_means_no_session(self):
+        """Auth0 returns none when the audience is wrong or unregistered."""
+        started, after = self._callback({"email": "ash@example.com"}, access_token=None)
+        assert started.status_code == 502
+        assert after.status_code == 401, "a failed login must not leave a session"
+
+    def test_the_failure_names_the_audience_it_asked_for(self):
+        started, _ = self._callback({"email": "ash@example.com"}, access_token=None)
+        assert config().audience in started.json()["detail"]
+
+    def test_a_stranger_is_let_in_and_simply_sees_nothing(self):
+        """Not this service's call. The vault answers it, per project.
+
+        Anyone in the Auth0 tenant can hold a session here; membership is what
+        decides whether any project is visible through it.
+        """
         started, after = self._callback({"email": "stranger@example.com"})
-        assert started.status_code == 403
-        assert after.status_code == 401, "a refused login must not leave a session"
+        assert started.status_code in (302, 307)
+        assert after.json()["email"] == "stranger@example.com"
 
-    def test_refusal_names_the_identity_it_refused(self):
-        """Otherwise a wrong account is indistinguishable from a missing entry."""
-        started, _ = self._callback({"email": "stranger@example.com"})
-        assert started.json()["signed_in_as"] == "stranger@example.com"
-
-    def test_missing_email_is_refused(self):
-        started, after = self._callback({"name": "No Email"})
-        assert started.status_code == 403
-        assert after.status_code == 401
-
-    def test_empty_allowlist_refuses_a_valid_identity(self):
-        started, after = self._callback(
-            {"email": "ash@example.com"}, WEB_ALLOWED_EMAILS=""
-        )
-        assert started.status_code == 403
-        assert after.status_code == 401
-
-    def test_signed_in_user_can_reach_the_proxy(self):
+    def test_the_session_carries_the_users_token_to_the_vault(self):
         """Ties the session to the thing it guards."""
 
         async def scenario():
@@ -227,6 +231,63 @@ class TestCallbackEnforcesTheAllowlist:
         # Upstream is deliberately unreachable: 502 proves the request got past
         # the session gate and was actually forwarded.
         assert run(scenario()).status_code == 502
+
+
+class TestProxyForwarding:
+    """What actually reaches the vault.
+
+    Asserting the proxy returns 502 against a dead upstream proves the request
+    left the building; it says nothing about what was on it. These stand a
+    real upstream up and look at the request.
+    """
+
+    def _through_proxy(self, handler, **overrides):
+        from starlette.routing import Route
+
+        async def scenario():
+            import httpx2
+            from starlette.applications import Starlette
+
+            upstream = Starlette(routes=[Route("/api/{rest:path}", handler)])
+            async with Server(upstream) as vault_srv:
+                application = web.build_app(
+                    config(VAULT_API_URL=f"http://127.0.0.1:{vault_srv.port}", **overrides),
+                    oauth=FakeAuth0({"email": "ash@example.com"}),
+                )
+                async with Server(application) as srv:
+                    # One client with its own cookie jar, so a cleared session
+                    # is actually cleared here too. Passing cookies per request
+                    # would keep handing back the stale one and the test would
+                    # pass whatever the service did.
+                    async with httpx2.AsyncClient(follow_redirects=False) as client:
+                        base = f"http://127.0.0.1:{srv.port}"
+                        await client.get(f"{base}/auth/callback")
+                        proxied = await client.get(f"{base}/api/projects")
+                        after = await client.get(f"{base}/whoami")
+                        return proxied, after
+
+        return run(scenario())
+
+    def test_the_users_own_token_is_forwarded(self):
+        seen = {}
+
+        async def handler(request):
+            seen["authorization"] = request.headers.get("authorization")
+            return JSONResponse({"projects": []})
+
+        proxied, _ = self._through_proxy(handler)
+        assert proxied.status_code == 200
+        assert seen["authorization"] == "Bearer vault-access-token"
+
+    def test_an_expired_token_ends_the_session(self):
+        """Otherwise the browser loops on 401s holding a cookie that looks fine."""
+
+        async def handler(request):
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+
+        proxied, after = self._through_proxy(handler)
+        assert proxied.status_code == 401
+        assert after.status_code == 401, "the stale session must be dropped"
 
 
 class TestCookieSecurity:
@@ -274,8 +335,32 @@ class TestCookieSecurity:
         payload = cookie.split("=", 1)[1].split(".")[0]
         decoded = base64.b64decode(payload + "==").decode("utf-8", "replace")
         assert "ash@example.com" in decoded
-        assert BASE_ENV["VAULT_API_TOKEN"] not in decoded
+        assert "vault-access-token" not in decoded
         assert BASE_ENV["AUTH0_CLIENT_SECRET"] not in decoded
+
+    def test_the_sealed_token_still_round_trips(self):
+        """Unreadable to the browser, still usable by this service."""
+        secret = BASE_ENV["SESSION_SECRET"]
+        assert web.unseal(secret, web.seal(secret, "abc.def.ghi")) == "abc.def.ghi"
+
+    def test_a_token_sealed_under_another_secret_is_refused(self):
+        assert web.unseal("rotated", web.seal("original", "abc.def.ghi")) is None
+
+    def test_the_cookie_stays_within_the_browser_limit(self):
+        """A session too big to set is a login that silently never completes."""
+
+        async def scenario():
+            import httpx2
+
+            application = web.build_app(
+                config(),
+                oauth=FakeAuth0({"email": "ash@example.com"}, "x" * 1200),
+            )
+            async with Server(application) as srv:
+                async with httpx2.AsyncClient(follow_redirects=False) as client:
+                    return await client.get(f"http://127.0.0.1:{srv.port}/auth/callback")
+
+        assert len(run(scenario()).headers.get("set-cookie", "")) < 4096
 
 
 class TestForwardedHeaders:

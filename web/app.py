@@ -6,11 +6,20 @@ the vault service's JSON API.
 
 The shape that matters:
 
-    browser --session cookie--> this service --bearer token--> vault API
+    browser --session cookie--> this service --the user's own token--> vault API
 
-The vault token lives only here. It is never sent to the browser, never
-embedded in a page, and the proxy only forwards GETs to a fixed list of
-paths — an open proxy holding a credential would be worse than no auth.
+This service holds no credential of its own. At sign-in it asks Auth0 for an
+access token scoped to the vault, keeps it in the session, and forwards that.
+So the vault applies the same membership rules to a page view as it does to a
+tool call, and someone who is not on a project cannot see it here either.
+
+Deciding access here instead would mean a second rule to keep in step with
+the first, and the first time they disagreed one of them would be wrong.
+
+The proxy still only forwards GETs to a fixed list of paths: a general proxy
+that attaches somebody's bearer token is worth attacking. The token itself is
+encrypted before it goes into the session, because a Starlette session is
+signed and not encrypted — see seal() below.
 """
 
 from __future__ import annotations
@@ -55,22 +64,27 @@ class Config:
         self.client_id = env.get("AUTH0_CLIENT_ID", "").strip()
         self.client_secret = env.get("AUTH0_CLIENT_SECRET", "").strip()
         self.vault_url = (env.get("VAULT_API_URL") or "").strip().rstrip("/")
-        self.vault_token = env.get("VAULT_API_TOKEN", "").strip()
         self.session_secret = env.get("SESSION_SECRET", "").strip()
         # Secure cookies are correct in production, but a local run over
         # http:// would never keep a session, so this is opt-out by name.
         self.insecure_cookie = (
             env.get("SESSION_INSECURE_COOKIE", "").strip().lower() == "true"
         )
-        self.allowed_emails = tuple(
-            e.strip().lower()
-            for e in (env.get("WEB_ALLOWED_EMAILS") or "").split(",")
-            if e.strip()
-        )
 
     @property
     def metadata_url(self) -> str:
         return f"{self.issuer}/.well-known/openid-configuration"
+
+    @property
+    def audience(self) -> str:
+        """What to ask Auth0 for a token against.
+
+        The vault's router URL. The read API is cross-project in the same way
+        the router is — one credential, the project named per call — so a token
+        good for one is the right reach for the other, and no separate Auth0
+        API has to be registered for the front-end.
+        """
+        return f"{self.vault_url}/mcp"
 
     def missing(self) -> list[str]:
         required = {
@@ -83,17 +97,42 @@ class Config:
         return sorted(name for name, value in required.items() if not value)
 
 
-def is_allowed(email: str | None, allowed: tuple[str, ...]) -> bool:
-    """Whether a signed-in identity may read the vaults.
+def _cipher(secret: str):
+    """Symmetric key for the session token, derived from SESSION_SECRET.
 
-    Fail closed when no allowlist is configured. An Auth0 tenant will happily
-    let a stranger sign up through a social connection, and what is behind this
-    door is decision reasoning and verbatim transcript excerpts — the content
-    you would least want a stranger reading.
+    Derived rather than configured separately: one secret to rotate, and
+    rotating it invalidates the sessions holding tokens encrypted under it,
+    which is the behaviour you want from rotating a session secret anyway.
     """
-    if not allowed:
-        return False
-    return bool(email) and email.strip().lower() in allowed
+    import base64
+    import hashlib
+
+    from cryptography.fernet import Fernet
+
+    return Fernet(base64.urlsafe_b64encode(hashlib.sha256(secret.encode()).digest()))
+
+
+def seal(secret: str, value: str) -> str:
+    """Encrypt the vault token for storage in the session cookie.
+
+    A Starlette session is signed, not encrypted: the browser can read the
+    payload. A bearer token sitting there in clear would be readable by
+    anything that can read the cookie and usable directly against the vault —
+    outside this proxy's GET-only path allowlist and for the token's whole
+    lifetime, rather than only through the routes it is meant for.
+    """
+    return _cipher(secret).encrypt(value.encode()).decode()
+
+
+def unseal(secret: str, value: str) -> str | None:
+    from cryptography.fernet import InvalidToken
+
+    try:
+        return _cipher(secret).decrypt(value.encode()).decode()
+    except (InvalidToken, ValueError, TypeError):
+        # A session sealed under a previous SESSION_SECRET. Treated as no
+        # token at all, which sends the caller back through Auth0.
+        return None
 
 
 def api_path_allowed(path: str) -> bool:
@@ -177,7 +216,12 @@ def build_app(config: Config | None = None, oauth=None) -> Starlette:
                 {"error": "not configured", "missing": config.missing()}, status_code=500
             )
         redirect_uri = callback_url(request)
-        return await oauth.auth0.authorize_redirect(request, redirect_uri)
+        # Ask for a token the vault will accept. Without an audience Auth0
+        # returns an opaque token that is fine for /userinfo and useless as a
+        # credential to another service.
+        return await oauth.auth0.authorize_redirect(
+            request, redirect_uri, audience=config.audience
+        )
 
     async def callback(request):
         try:
@@ -188,20 +232,27 @@ def build_app(config: Config | None = None, oauth=None) -> Starlette:
 
         claims = token.get("userinfo") or {}
         email = claims.get("email")
-        if not is_allowed(email, config.allowed_emails):
-            log.warning("login: rejected email=%r (not in WEB_ALLOWED_EMAILS)", email)
-            # Name the identity that was refused: without it the operator
-            # cannot tell a wrong account from a missing allowlist entry.
+        access_token = token.get("access_token")
+        if not access_token:
+            # Signing in proves who someone is; it does not prove the vault
+            # will talk to them. Without the token there is nothing to forward,
+            # and a session that looks valid but can read nothing is worse than
+            # a refused login.
+            log.warning("login: no access token for %r (audience misconfigured?)", email)
             return JSONResponse(
                 {
-                    "error": "not authorised",
+                    "error": "no vault access token",
                     "signed_in_as": email,
-                    "detail": "Add this address to WEB_ALLOWED_EMAILS to grant access.",
+                    "detail": f"Auth0 returned no access token for {config.audience}.",
                 },
-                status_code=403,
+                status_code=502,
             )
 
-        request.session["user"] = {"email": email, "name": claims.get("name"), "sub": claims.get("sub")}
+        request.session["user"] = {
+            "email": email, "name": claims.get("name"), "sub": claims.get("sub")
+        }
+        request.session["vault_token"] = seal(config.session_secret, access_token)
+        # Whether this person can see anything is the vault's answer, not ours.
         log.info("login: accepted %s", email)
         return RedirectResponse("/")
 
@@ -226,15 +277,25 @@ def build_app(config: Config | None = None, oauth=None) -> Starlette:
         url = f"{config.vault_url}{path}"
         if request.url.query:
             url = f"{url}?{request.url.query}"
-        headers = (
-            {"Authorization": f"Bearer {config.vault_token}"} if config.vault_token else {}
-        )
+        sealed = request.session.get("vault_token")
+        vault_token = unseal(config.session_secret, sealed) if sealed else None
+        if sealed and vault_token is None:
+            request.session.clear()
+            return JSONResponse({"error": "session expired"}, status_code=401)
+        headers = {"Authorization": f"Bearer {vault_token}"} if vault_token else {}
         try:
             async with httpx.AsyncClient(timeout=20) as client:
                 upstream = await client.get(url, headers=headers)
         except Exception as exc:  # noqa: BLE001 - upstream shape is not ours to assume
             log.warning("proxy: %s failed: %s", path, exc)
             return JSONResponse({"error": "vault unreachable"}, status_code=502)
+
+        if upstream.status_code == 401:
+            # The forwarded token has expired. Drop the session so the next
+            # page load goes back through Auth0 rather than looping on 401s
+            # with a cookie that looks signed in.
+            request.session.clear()
+            return JSONResponse({"error": "session expired"}, status_code=401)
 
         try:
             body = upstream.json()
@@ -273,8 +334,6 @@ if __name__ == "__main__":
     config = Config()
     if config.missing():
         log.warning("starting with missing configuration: %s", ", ".join(config.missing()))
-    if not config.allowed_emails:
-        log.warning("WEB_ALLOWED_EMAILS is empty — every sign-in will be refused")
     uvicorn.run(
         app,
         host=os.environ.get("HOST", "0.0.0.0"),

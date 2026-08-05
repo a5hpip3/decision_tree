@@ -20,7 +20,6 @@ from __future__ import annotations
 import logging
 import os
 import re
-import secrets
 
 from mcp.server.transport_security import TransportSecuritySettings
 from starlette.applications import Starlette
@@ -174,18 +173,21 @@ def transport_security(allowed_hosts: str | None) -> TransportSecuritySettings |
 
 
 def build_app(
-    token: str | None = None,
     allowed_hosts: str | None = None,
     oauth_config: oauth.OAuthConfig | None = None,
     verifier: oauth.TokenVerifier | None = None,
 ):
     """ASGI app routing /p/<project>/mcp to the MCP server.
 
-    token: if set, a request may authenticate with this static bearer token.
-    oauth_config: if set, a request may instead present a JWT from that issuer,
-        and the server advertises RFC 9728 metadata so clients can obtain one.
-    Either credential is sufficient; with neither configured the server is open.
-    Health, index and the metadata documents stay unauthenticated by design.
+    oauth_config: if set, a request must present a JWT from that issuer, and
+        the server advertises RFC 9728 metadata so clients can obtain one.
+        With it unset the server is open, which is only for local runs.
+
+    There is deliberately no shared-secret option. One token that opens every
+    project cannot say who is calling, so nothing it does can be attributed and
+    revoking one holder revokes all of them — which is the whole of what made
+    this single-user. Health, index and the metadata documents stay
+    unauthenticated by design.
     """
     mcp_app = server.mcp.streamable_http_app(
         stateless_http=True,
@@ -215,25 +217,19 @@ def build_app(
     async def authorize(scope, project):
         """(reason, identity). Reason is None if the request may proceed.
 
-        The identity is whoever the token turned out to belong to, and is None
-        whenever the request was let through without one — an open server, or
-        the static shared token, which names a machine rather than a person.
+        The identity is whoever the token turned out to belong to. It is None
+        only on an unconfigured server, which has no issuer to verify against.
         """
-        if token is None and oauth_config is None:
+        if oauth_config is None:
             return None, None
         presented = _bearer(scope)
         if presented is None:
             log.warning("auth: no credential for project=%s", project)
             return "no bearer credential presented", None
-        if token is not None and secrets.compare_digest(presented, token):
-            return None, None
         placeholder = unexpanded_variable(presented)
         if placeholder:
             log.warning("auth: unexpanded %s for project=%s", placeholder, project)
             return placeholder_reason(placeholder), None
-        if oauth_config is None:
-            log.warning("auth: static token mismatch for project=%s", project)
-            return "invalid token", None
 
         expected = resource_url_for(scope, project)
         try:
@@ -280,7 +276,7 @@ def build_app(
             return
 
         if path.startswith(API_PREFIX):
-            await _api_response(scope, receive, send, path, token, oauth_config, verifier)
+            await _api_response(scope, receive, send, path, oauth_config, verifier)
             return
 
         router = path == ROUTER_PATH
@@ -306,12 +302,14 @@ def build_app(
         inner = dict(scope, path=MCP_SUFFIX, raw_path=MCP_SUFFIX.encode())
         router_token = server.ROUTER.set(router)
         identity_token = server.IDENTITY.set(identity)
+        verifies_token = server.VERIFIES.set(oauth_config is not None)
         project_token = None if router else server.REMOTE_PROJECT.set(project)
         try:
             await mcp_app(inner, receive, send)
         finally:
             server.ROUTER.reset(router_token)
             server.IDENTITY.reset(identity_token)
+            server.VERIFIES.reset(verifies_token)
             if project_token is not None:
                 server.REMOTE_PROJECT.reset(project_token)
 
@@ -330,34 +328,35 @@ def _bearer(scope) -> str | None:
     return None
 
 
-async def _api_authorized(scope, token, oauth_config, verifier) -> str | None:
-    """Auth for the read API. None if allowed, else a reason.
+async def _api_authorized(scope, oauth_config, verifier):
+    """(reason, identity) for the read API. Reason is None if allowed.
 
-    The API is cross-project, so there is no per-project resource URL to check
-    a JWT audience against. A JWT is therefore only accepted when a single
-    fixed audience is configured; otherwise the static token is the way in,
-    which is what the web service uses.
+    The audience checked is the router's own URL. The API is cross-project in
+    the same way the router is — one credential, the project named per call —
+    so a token good for one is exactly the right reach for the other, and no
+    second Auth0 API has to exist for the front-end to use.
+
+    The web service forwards the signed-in person's token rather than one of
+    its own, which is what lets this apply the same membership rules the MCP
+    tools do instead of a second allowlist that can drift from them.
     """
-    if token is None and oauth_config is None:
-        return None
+    if oauth_config is None:
+        return None, None
     presented = _bearer(scope)
     if presented is None:
-        return "no bearer credential presented"
-    if token is not None and secrets.compare_digest(presented, token):
-        return None
+        return "no bearer credential presented", None
     placeholder = unexpanded_variable(presented)
     if placeholder:
-        return placeholder_reason(placeholder)
-    if oauth_config is None or not oauth_config.audience:
-        return "invalid token"
+        return placeholder_reason(placeholder), None
+    expected = f"{request_origin(scope)}{ROUTER_PATH}"
     try:
-        await verifier.verify(presented, oauth_config.audience)
+        claims = await verifier.verify(presented, expected)
     except oauth.AuthError as exc:
-        return str(exc)
-    return None
+        return str(exc), None
+    return None, server.identity_from_claims(claims)
 
 
-async def _api_response(scope, receive, send, path, token, oauth_config, verifier):
+async def _api_response(scope, receive, send, path, oauth_config, verifier):
     """Route and serve /api/... — read-only JSON over the hosted vaults."""
     if scope.get("method", "GET") != "GET":
         await JSONResponse({"error": "method not allowed"}, status_code=405)(
@@ -365,7 +364,7 @@ async def _api_response(scope, receive, send, path, token, oauth_config, verifie
         )
         return
 
-    reason = await _api_authorized(scope, token, oauth_config, verifier)
+    reason, identity = await _api_authorized(scope, oauth_config, verifier)
     if reason is not None:
         log.warning("api: rejected path=%s reason=%s", path, reason)
         await JSONResponse(
@@ -373,6 +372,17 @@ async def _api_response(scope, receive, send, path, token, oauth_config, verifie
         )(scope, receive, send)
         return
 
+    identity_token = server.IDENTITY.set(identity)
+    verifies_token = server.VERIFIES.set(oauth_config is not None)
+    try:
+        await _api_route(scope, receive, send, path)
+    finally:
+        server.IDENTITY.reset(identity_token)
+        server.VERIFIES.reset(verifies_token)
+
+
+async def _api_route(scope, receive, send, path):
+    """Serve one /api/... path as whoever the token belongs to."""
     rest = path[len(API_PREFIX) :].strip("/")
     parts = rest.split("/") if rest else []
 
@@ -436,7 +446,6 @@ async def _metadata_response(scope, receive, send, path, oauth_config):
 
 
 app = build_app(
-    token=os.environ.get("CONTEXT_VAULT_TOKEN") or None,
     allowed_hosts=os.environ.get("CONTEXT_VAULT_ALLOWED_HOSTS") or None,
     oauth_config=oauth.OAuthConfig.from_env(os.environ),
 )

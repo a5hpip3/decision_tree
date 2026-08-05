@@ -19,6 +19,67 @@ sys.path.insert(0, str(_ROOT / "web"))
 import server  # noqa: E402
 
 
+# One key for the whole suite: generating a 2048-bit RSA key costs real time
+# and every test that needs one needs the same one, so an app and the tokens
+# it will accept can be built independently.
+_KEY = None
+TEST_ISSUER = "https://tenant.us.auth0.com/"
+
+
+def _key():
+    global _KEY
+    if _KEY is None:
+        from cryptography.hazmat.primitives.asymmetric import rsa
+
+        _KEY = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    return _KEY
+
+
+def oauth_app(**kw):
+    """An app that verifies credentials, with the JWKS fetch stubbed out.
+
+    The crypto is real; only the network lookup of the signing key is not.
+    """
+    import http_app
+    import oauth
+
+    public = _key().public_key()
+    stub = type("S", (), {
+        "get_signing_key_from_jwt": lambda self, t: type("K", (), {"key": public})()
+    })()
+    config = oauth.OAuthConfig(issuer=TEST_ISSUER)
+    return http_app.build_app(
+        oauth_config=config,
+        verifier=oauth.TokenVerifier(config, jwk_client=stub),
+        **kw,
+    )
+
+
+def api_token(port: int, **claims) -> str:
+    """A token the read API will accept, addressed to the router.
+
+    The API checks the router's own URL as the audience: it is cross-project
+    in the same way the router is, so one credential covers both and no
+    separate Auth0 API has to exist for the front-end.
+    """
+    import time
+
+    import jwt
+
+    now = int(time.time())
+    payload = {
+        "iss": TEST_ISSUER,
+        "aud": f"http://127.0.0.1:{port}/mcp",
+        "sub": "auth0|user",
+        "iat": now,
+        "exp": now + 3600,
+    }
+    payload.update(claims)
+    for key in [k for k, v in payload.items() if v is None]:
+        del payload[key]
+    return jwt.encode(payload, _key(), algorithm="RS256")
+
+
 def add_member(project: str, email: str, role: str = "member") -> None:
     """Put someone on a hosted project, as an owner's invite eventually will.
 

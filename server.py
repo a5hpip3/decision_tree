@@ -155,11 +155,27 @@ class Identity:
         return (self.email or self.subject)[:MAX_AUTHOR]
 
 
-# Set per request by http_app once a token verifies. None over stdio, and None
-# for the static shared token, which identifies a machine rather than a person.
+# Set per request by http_app once a token verifies. None over stdio.
 IDENTITY: contextvars.ContextVar[Identity | None] = contextvars.ContextVar(
     "identity", default=None
 )
+
+# Set by http_app when the deployment verifies credentials at all.
+VERIFIES: contextvars.ContextVar[bool] = contextvars.ContextVar("verifies", default=False)
+
+
+def gated() -> bool:
+    """Whether this call is subject to membership.
+
+    True as soon as somebody is identified, and true on any deployment that
+    checks credentials — where a missing identity means the caller got in
+    without one, which must not then be read as permission.
+
+    False only where there is nobody to identify and nothing to identify them
+    with: a local run, where the vault is a file belonging to whoever is
+    reading it.
+    """
+    return IDENTITY.get() is not None or VERIFIES.get()
 
 # Auth0 will not emit a bare `email` claim in an access token, so a tenant
 # Action has to add a namespaced one. Both are read: the namespaced claim is
@@ -377,15 +393,18 @@ def authorise(need: str) -> str | None:
     Only hosted projects are gated. Over stdio the vault is a file in the
     caller's own checkout, and there is no second party to protect it from.
     """
-    if REMOTE_PROJECT.get() is None:
+    if REMOTE_PROJECT.get() is None or not gated():
         return None
 
     identity = IDENTITY.get()
     if identity is None:
-        # The static shared token predates membership and still opens every
-        # project. It is the one remaining way past this check and goes when
-        # the token itself does.
-        return None
+        # Nothing reaches a hosted project without saying who it is. There used
+        # to be a shared token that did, which is the same as saying every
+        # project was readable by anyone holding one secret.
+        return (
+            "Error: this project needs you to be signed in. Reconnect the "
+            "connector so it can authenticate you."
+        )
 
     if REMOTE_PROJECT.get() not in remote_projects():
         return unknown_project(REMOTE_PROJECT.get())
@@ -426,13 +445,15 @@ def may_act_on(row: sqlite3.Row) -> str | None:
     A member retires their own mistakes; declaring that somebody else's
     decision should never have been recorded is an owner's call.
     """
-    if REMOTE_PROJECT.get() is None:
+    if REMOTE_PROJECT.get() is None or not gated():
         return None
     identity = IDENTITY.get()
     if identity is None:
         return None
     with closing(connect()) as conn:
         role = claim_membership(conn, identity)
+    if role is None:
+        return None          # authorise() has already refused this caller
     if RANK[role] >= NEEDS["admin"]:
         return None
     if row["author"] and row["author"] == identity.label:
@@ -446,10 +467,12 @@ def may_act_on(row: sqlite3.Row) -> str | None:
 
 def visible_projects() -> list[str]:
     """Hosted projects the caller is a member of."""
+    if not gated():
+        return remote_projects()
     identity = IDENTITY.get()
-    names = remote_projects()
     if identity is None:
-        return names          # static token, as above
+        return []
+    names = remote_projects()
     out = []
     for name in names:
         token = REMOTE_PROJECT.set(name)

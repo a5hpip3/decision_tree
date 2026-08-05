@@ -13,7 +13,7 @@ import pytest
 
 import http_app
 import server
-from conftest import unwrap
+from conftest import unwrap, oauth_app
 from test_http import Server, run
 
 log_decision = unwrap(server.log_decision)
@@ -159,7 +159,17 @@ class TestRoutingOverHttp:
         assert self._post("/p/alpha/mcp", self.INIT).status_code == 200
 
     def test_router_still_requires_auth(self, vault):
-        assert self._post("/mcp", self.INIT, token="secret").status_code == 401
+        """The project-less endpoint is not a way around authentication."""
+        async def scenario():
+            import httpx2
+
+            async with Server(oauth_app()) as srv:
+                async with httpx2.AsyncClient() as client:
+                    return await client.post(
+                        f"http://127.0.0.1:{srv.port}/mcp", json={}
+                    )
+
+        assert run(scenario()).status_code == 401
 
     def test_index_advertises_both_endpoints(self, vault):
         async def scenario():

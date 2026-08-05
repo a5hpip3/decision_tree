@@ -342,47 +342,6 @@ class TestOverHttp:
 
         assert run(scenario()).status_code == 401
 
-    def test_static_token_still_works_alongside_oauth(self, vault, keypair):
-        """Claude Code uses the static token; claude.ai uses OAuth."""
-
-        async def scenario():
-            async with Server(self._app(keypair, token="secret")) as srv:
-                return await call(
-                    srv.url("decision-tree"),
-                    "get_project_brief",
-                    headers={"Authorization": "Bearer secret"},
-                )
-
-        assert "no recorded history" in run(scenario())
-
-    def test_metadata_404s_when_oauth_disabled(self, vault):
-        async def scenario():
-            import httpx2
-
-            async with Server(http_app.build_app(token="secret")) as srv:
-                base = f"http://127.0.0.1:{srv.port}"
-                async with httpx2.AsyncClient() as client:
-                    return await client.get(
-                        f"{base}/.well-known/oauth-protected-resource/p/x/mcp"
-                    )
-
-        assert run(scenario()).status_code == 404
-
-    def test_no_challenge_header_without_oauth(self, vault):
-        """Without an OAuth flow to start, don't send clients hunting."""
-
-        async def scenario():
-            import httpx2
-
-            async with Server(http_app.build_app(token="secret")) as srv:
-                async with httpx2.AsyncClient() as client:
-                    return await client.post(srv.url("alpha"), json={})
-
-        response = run(scenario())
-        assert response.status_code == 401
-        assert "www-authenticate" not in response.headers
-
-
 class TestForwardedHeaders:
     """Behind a TLS-terminating proxy the app speaks http, but the advertised
     resource URL must be the https one the user actually entered."""
