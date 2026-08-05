@@ -253,11 +253,16 @@ def build_app(
                 describe_token(presented),
             )
             return str(exc), None
+        # Claim names, not values: whether a tenant Action actually fired is
+        # otherwise invisible from this side, and the failure mode is silent —
+        # Auth0 drops a custom claim whose namespace is malformed rather than
+        # erroring, so a missing email and a mistyped namespace look identical.
         log.info(
-            "auth: accepted token=%s project=%s sub=%s",
+            "auth: accepted token=%s project=%s sub=%s claims=%s",
             token_fingerprint(presented),
             project,
             claims.get("sub"),
+            ",".join(sorted(claims)),
         )
         return None, server.identity_from_claims(claims)
 

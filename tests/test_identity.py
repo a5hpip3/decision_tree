@@ -585,3 +585,45 @@ class TestSeedOwner:
 
     def test_roles_are_a_closed_set(self):
         assert server.ROLES == ("owner", "member", "viewer")
+
+
+class TestAuthDiagnostics:
+    """Whether a tenant Action fired is invisible from the server otherwise.
+
+    Auth0 silently drops a custom claim whose namespace is malformed, so a
+    missing email and a mistyped namespace produce the same token. Logging the
+    claim names distinguishes them without putting values in the log.
+    """
+
+    def _app(self, keypair, **kwargs):
+        _, public = keypair
+        stub = type(
+            "S", (), {"get_signing_key_from_jwt": lambda self, t: type("K", (), {"key": public})()}
+        )()
+        config = oauth.OAuthConfig(issuer=ISSUER)
+        return http_app.build_app(
+            oauth_config=config, verifier=oauth.TokenVerifier(config, jwk_client=stub), **kwargs
+        )
+
+    def test_claim_names_are_logged_without_their_values(self, vault, keypair, caplog):
+        from test_http import call
+
+        async def scenario():
+            async with Server(self._app(keypair)) as srv:
+                token = make_token(
+                    keypair, aud=srv.url("shared"), sub="auth0|one",
+                    **{server.EMAIL_CLAIM: "one@example.com"},
+                )
+                await call(
+                    srv.url("shared"), "log_decision",
+                    {"summary": "d", "reasoning": "r", "excerpt": "x"},
+                    headers={"Authorization": f"Bearer {token}"},
+                )
+
+        with caplog.at_level("INFO", logger="context-vault.auth"):
+            run(scenario())
+
+        accepted = [r.getMessage() for r in caplog.records if "auth: accepted" in r.getMessage()]
+        assert accepted, "no acceptance was logged"
+        assert server.EMAIL_CLAIM in accepted[0]
+        assert "one@example.com" not in accepted[0]
