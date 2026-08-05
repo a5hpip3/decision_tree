@@ -17,6 +17,7 @@ import hashlib
 import os
 import re
 import sqlite3
+import dataclasses
 from contextlib import closing, contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -63,7 +64,26 @@ CREATE TABLE IF NOT EXISTS meta (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
+
+-- Who may reach this project. Written and seeded now, enforced later: getting
+-- ownership recorded before anything depends on it means the change that turns
+-- on enforcement cannot also be the change that decides who owns what.
+--
+-- A row can exist before its subject is known. An owner invites an email
+-- address, and the token subject is filled in the first time that person
+-- actually signs in — so `subject` is null until claimed, and `email` is null
+-- for anyone added by subject alone.
+CREATE TABLE IF NOT EXISTS members (
+    id       INTEGER PRIMARY KEY AUTOINCREMENT,
+    subject  TEXT UNIQUE,
+    email    TEXT UNIQUE,
+    role     TEXT NOT NULL,
+    added_at TEXT NOT NULL,
+    added_by TEXT
+);
 """
+
+ROLES = ("owner", "member", "viewer")
 
 # Columns added after the first release. CREATE TABLE IF NOT EXISTS silently
 # leaves an existing table alone, so they have to be added explicitly.
@@ -104,6 +124,73 @@ REMOTE_PROJECT: contextvars.ContextVar[str | None] = contextvars.ContextVar(
 # connector cannot be talked out of its project; the router has none to start
 # with, so every tool has to be told.
 ROUTER: contextvars.ContextVar[bool] = contextvars.ContextVar("router", default=False)
+
+
+@dataclasses.dataclass(frozen=True)
+class Identity:
+    """Who is making this call, according to a credential the server verified.
+
+    `subject` is the token's `sub`: stable, opaque, and always present.
+    `email` is only there once the tenant adds it as a custom claim, because an
+    Auth0 access token for a custom API carries sub/aud/iss/scope and nothing
+    else. Everything here therefore has to work with subject alone.
+    """
+
+    subject: str
+    email: str = ""
+
+    @property
+    def label(self) -> str:
+        """How this person is recorded as the author of a decision."""
+        # Truncated rather than rejected: an author the server derived itself
+        # must never turn into a validation error the caller cannot act on.
+        return (self.email or self.subject)[:MAX_AUTHOR]
+
+
+# Set per request by http_app once a token verifies. None over stdio, and None
+# for the static shared token, which identifies a machine rather than a person.
+IDENTITY: contextvars.ContextVar[Identity | None] = contextvars.ContextVar(
+    "identity", default=None
+)
+
+# Auth0 will not emit a bare `email` claim in an access token, so a tenant
+# Action has to add a namespaced one. Both are read: the namespaced claim is
+# what production will send, the plain one keeps tests and any other issuer
+# straightforward.
+EMAIL_CLAIM = "https://decisiontree/email"
+
+
+def identity_from_claims(claims) -> Identity | None:
+    """Build an Identity from verified token claims, or None if unusable.
+
+    A token with no subject cannot attribute anything, and inventing a
+    placeholder would put an unattributable decision in a shared log under a
+    name that looks real.
+    """
+    subject = str(claims.get("sub") or "").strip()
+    if not subject:
+        return None
+    email = ""
+    for key in (EMAIL_CLAIM, "email"):
+        value = claims.get(key)
+        if isinstance(value, str) and value.strip():
+            email = value.strip().lower()
+            break
+    return Identity(subject=subject, email=email)
+
+
+def attributed_author(supplied: str) -> str:
+    """Who to record as the author of a decision.
+
+    A verified credential outranks whatever the client sent. `author` is an
+    ordinary tool argument, so the model on the other end can put any name in
+    it — harmless in a private vault, but in a shared project it is a byline
+    anyone can forge. When the caller authenticated, the token is the answer
+    and the supplied value is dropped rather than merged, so there is exactly
+    one story about where attribution comes from.
+    """
+    identity = IDENTITY.get()
+    return identity.label if identity is not None else supplied
 
 # A remote project name becomes a filename, so it is validated rather than
 # sanitised — anything not matching this is rejected at the edge, never coerced.
@@ -265,22 +352,109 @@ def project_label() -> str:
     return onboarding.read_declared_name(root) or root.name
 
 
+# Long enough to outlast a competing write, short enough that a caller gets an
+# answer rather than a hung tool call.
+BUSY_TIMEOUT_MS = 5000
+
+
+@contextmanager
+def writing(conn: sqlite3.Connection):
+    """A write transaction that takes its lock before the first read.
+
+    Every write path here reads before it writes — is this decision already
+    superseded, already retired — and then acts on what it read. SQLite's
+    default deferred transaction takes no lock until the write itself, so two
+    callers can both pass the same check before either of them writes. Taking
+    the write lock up front is what makes those checks mean anything once more
+    than one person is logging into a project.
+    """
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        yield conn
+    except BaseException:
+        conn.rollback()
+        raise
+    conn.commit()
+
+
 def connect() -> sqlite3.Connection:
     path = db_path()
     path.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(path)
+    # isolation_level=None turns off the implicit transactions sqlite3 would
+    # otherwise open, so writing() above is the only thing that begins one and
+    # its BEGIN IMMEDIATE can never collide with one already in flight.
+    conn = sqlite3.connect(path, isolation_level=None)
     conn.row_factory = sqlite3.Row
+    conn.execute(f"PRAGMA busy_timeout = {BUSY_TIMEOUT_MS}")
+    enable_wal(conn)
     conn.executescript(SCHEMA)
     migrate(conn)
-    with conn:
-        # Records which project a hashed filename belongs to. INSERT OR IGNORE
-        # so the value reflects where the vault was created, not wherever it
-        # happens to be read from later.
-        conn.execute(
-            "INSERT OR IGNORE INTO meta (key, value) VALUES ('project_path', ?)",
-            (project_identity(),),
-        )
+    bootstrap(conn)
     return conn
+
+
+def enable_wal(conn: sqlite3.Connection) -> None:
+    """Put the file in WAL mode, so readers are not stuck behind a writer.
+
+    Journal mode is a property of the file rather than of the connection, so
+    this only has to succeed once per vault, ever — hence the check before the
+    switch, which is what keeps every later connection off the write path.
+
+    The switch needs a lock nobody else holds and, unlike an ordinary write, is
+    not covered by busy_timeout: while someone is mid-write it fails at once.
+    That failure is benign and is swallowed. Either the file is already WAL, or
+    the caller currently writing set it, or the next one to find it idle will.
+    Correctness under contention rests on BEGIN IMMEDIATE and the busy timeout;
+    WAL is a concurrency improvement layered on top of them, not a load-bearing
+    part of them.
+    """
+    if conn.execute("PRAGMA journal_mode").fetchone()[0].lower() == "wal":
+        return
+    try:
+        conn.execute("PRAGMA journal_mode = WAL")
+    except sqlite3.OperationalError:
+        pass
+
+
+def bootstrap(conn: sqlite3.Connection) -> None:
+    """One-time setup for a vault, skipped without taking a write lock.
+
+    connect() runs on every call, reads included. Opening a write transaction
+    each time would put every reader in the queue behind whoever happens to be
+    logging a decision — which is exactly what WAL was turned on to avoid. So
+    the checks are reads, and the lock is taken only when there is something to
+    write, which is once in a vault's life.
+    """
+    needs_meta = (
+        conn.execute("SELECT 1 FROM meta WHERE key = 'project_path'").fetchone() is None
+    )
+    owner = (os.environ.get("CONTEXT_VAULT_OWNER_EMAIL") or "").strip().lower()
+    # Seeding only ever fires on a vault with nobody on it, so it can never
+    # override a membership list somebody has actually edited.
+    needs_owner = bool(owner) and not conn.execute("SELECT 1 FROM members LIMIT 1").fetchone()
+    if not needs_meta and not needs_owner:
+        return
+
+    with writing(conn):
+        if needs_meta:
+            # Records which project a hashed filename belongs to. INSERT OR
+            # IGNORE so the value reflects where the vault was created, not
+            # wherever it happens to be read from later.
+            conn.execute(
+                "INSERT OR IGNORE INTO meta (key, value) VALUES ('project_path', ?)",
+                (project_identity(),),
+            )
+        if needs_owner:
+            # Enforcement lands in a later stage, and the moment it does a
+            # project with no members is a project nobody can reach, including
+            # whoever has been using it all along. Re-checked inside the lock
+            # because another caller may have seeded it since.
+            conn.execute(
+                "INSERT OR IGNORE INTO members (subject, email, role, added_at, added_by)"
+                " SELECT NULL, ?, 'owner', ?, 'bootstrap'"
+                " WHERE NOT EXISTS (SELECT 1 FROM members)",
+                (owner, now()),
+            )
 
 
 def history_note(superseded: int, retired: int) -> str:
@@ -323,10 +497,12 @@ def migrate(conn: sqlite3.Connection) -> None:
     missing column is normal, not an error.
     """
     existing = {row["name"] for row in conn.execute("PRAGMA table_info(decisions)")}
-    with conn:
-        for name, decl in ADDED_COLUMNS:
-            if name not in existing:
-                conn.execute(f"ALTER TABLE decisions ADD COLUMN {name} {decl}")
+    missing = [(name, decl) for name, decl in ADDED_COLUMNS if name not in existing]
+    if not missing:
+        return
+    with writing(conn):
+        for name, decl in missing:
+            conn.execute(f"ALTER TABLE decisions ADD COLUMN {name} {decl}")
 
 
 def capture_hints(conn: sqlite3.Connection, new_id: int, cluster: str, parent) -> str:
@@ -530,7 +706,9 @@ def log_decision(
         source: Where it was decided: chat, code, pr, or doc.
         ref: Pointer to the artifact — a PR number, file:line, ticket id, or
             document section.
-        author: Who made the call, if known.
+        author: Who made the call, if known. Ignored when the connection
+            is authenticated — the credential says who you are, and a
+            byline the caller types is one the caller can forge.
         created_at: Leave empty. The server stamps the time. Set it only when
             importing a decision that was recorded somewhere else and whose
             real date matters, as an ISO 8601 timestamp.
@@ -553,7 +731,8 @@ def _write_decision(
 ) -> str:
     """Insert one decision into whichever vault is currently bound."""
     parent = derives_from or None
-    with closing(connect()) as conn, conn:
+    author = attributed_author(author)
+    with closing(connect()) as conn, writing(conn):
         problem = check_context(conn, parent, cluster, source, ref, author)
         if problem:
             return problem
@@ -598,7 +777,9 @@ def supersede_decision(
             decision being replaced, which is almost always right.
         source: Where it was decided: chat, code, pr, or doc.
         ref: Pointer to the artifact — PR number, file:line, ticket, section.
-        author: Who made the call, if known.
+        author: Who made the call, if known. Ignored when the connection
+            is authenticated — the credential says who you are, and a
+            byline the caller types is one the caller can forge.
         project: Which project to act on. Required only on the router
             connector (a URL with no /p/<project>/ in it); omit it everywhere
             else. Call list_projects first if you are unsure of the name.
@@ -608,7 +789,8 @@ def supersede_decision(
 
 
 def _supersede_decision(decision_id, summary, reasoning, excerpt, cluster, source, ref, author) -> str:
-    with closing(connect()) as conn, conn:
+    author = attributed_author(author)
+    with closing(connect()) as conn, writing(conn):
         old = conn.execute("SELECT * FROM decisions WHERE id = ?", (decision_id,)).fetchone()
         if old is None:
             return f"Error: no decision #{decision_id}. Use list_decisions to find the right id."
@@ -671,7 +853,7 @@ def retire_decision(decision_id: int, reason: str, project: str = "") -> str:
 
 
 def _retire_decision(decision_id, reason) -> str:
-    with closing(connect()) as conn, conn:
+    with closing(connect()) as conn, writing(conn):
         row = conn.execute("SELECT * FROM decisions WHERE id = ?", (decision_id,)).fetchone()
         if row is None:
             return f"Error: no decision #{decision_id}. Use list_decisions to find the right id."

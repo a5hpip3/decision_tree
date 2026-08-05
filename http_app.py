@@ -212,23 +212,28 @@ def build_app(
             headers=headers,
         )(scope, receive, send)
 
-    async def authorize(scope, project) -> str | None:
-        """None if the request may proceed, else a reason to reject it."""
+    async def authorize(scope, project):
+        """(reason, identity). Reason is None if the request may proceed.
+
+        The identity is whoever the token turned out to belong to, and is None
+        whenever the request was let through without one — an open server, or
+        the static shared token, which names a machine rather than a person.
+        """
         if token is None and oauth_config is None:
-            return None
+            return None, None
         presented = _bearer(scope)
         if presented is None:
             log.warning("auth: no credential for project=%s", project)
-            return "no bearer credential presented"
+            return "no bearer credential presented", None
         if token is not None and secrets.compare_digest(presented, token):
-            return None
+            return None, None
         placeholder = unexpanded_variable(presented)
         if placeholder:
             log.warning("auth: unexpanded %s for project=%s", placeholder, project)
-            return placeholder_reason(placeholder)
+            return placeholder_reason(placeholder), None
         if oauth_config is None:
             log.warning("auth: static token mismatch for project=%s", project)
-            return "invalid token"
+            return "invalid token", None
 
         expected = resource_url_for(scope, project)
         try:
@@ -247,14 +252,14 @@ def build_app(
                 oauth_config.issuer_url,
                 describe_token(presented),
             )
-            return str(exc)
+            return str(exc), None
         log.info(
             "auth: accepted token=%s project=%s sub=%s",
             token_fingerprint(presented),
             project,
             claims.get("sub"),
         )
-        return None
+        return None, server.identity_from_claims(claims)
 
     async def app(scope, receive, send):
         if scope["type"] != "http":
@@ -286,7 +291,7 @@ def build_app(
             )(scope, receive, send)
             return
 
-        reason = await authorize(scope, project)
+        reason, identity = await authorize(scope, project)
         if reason is not None:
             await deny(scope, receive, send, project, reason)
             return
@@ -295,11 +300,13 @@ def build_app(
         # duration of this request.
         inner = dict(scope, path=MCP_SUFFIX, raw_path=MCP_SUFFIX.encode())
         router_token = server.ROUTER.set(router)
+        identity_token = server.IDENTITY.set(identity)
         project_token = None if router else server.REMOTE_PROJECT.set(project)
         try:
             await mcp_app(inner, receive, send)
         finally:
             server.ROUTER.reset(router_token)
+            server.IDENTITY.reset(identity_token)
             if project_token is not None:
                 server.REMOTE_PROJECT.reset(project_token)
 
