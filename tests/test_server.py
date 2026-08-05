@@ -458,6 +458,11 @@ def test_all_tools_are_registered():
         "name_project",
         "connect_hosted",
         "list_projects",
+        "share_project",
+        "list_members",
+        "revoke_access",
+        "create_invite",
+        "redeem_invite",
     }
 
 

@@ -18,6 +18,7 @@ import os
 import re
 import sqlite3
 import dataclasses
+import secrets
 from contextlib import closing, contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -73,6 +74,21 @@ CREATE TABLE IF NOT EXISTS meta (
 -- address, and the token subject is filled in the first time that person
 -- actually signs in — so `subject` is null until claimed, and `email` is null
 -- for anyone added by subject alone.
+-- A shareable invite. Only the hash of the code is kept, for the same reason
+-- a password is not stored: reading this table must not yield working invites.
+-- Single use and time-limited, because a link that has been forwarded around a
+-- Slack channel should stop working once somebody has taken it.
+CREATE TABLE IF NOT EXISTS invites (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    code_hash   TEXT NOT NULL UNIQUE,
+    role        TEXT NOT NULL,
+    created_at  TEXT NOT NULL,
+    created_by  TEXT,
+    expires_at  TEXT NOT NULL,
+    redeemed_at TEXT,
+    redeemed_by TEXT
+);
+
 CREATE TABLE IF NOT EXISTS members (
     id       INTEGER PRIMARY KEY AUTOINCREMENT,
     subject  TEXT UNIQUE,
@@ -91,7 +107,13 @@ ROLES = ("owner", "member", "viewer")
 # says a decision should never have been recorded at all, which on somebody
 # else's entry is an owner's call.
 RANK = {"viewer": 1, "member": 2, "owner": 3}
-NEEDS = {"read": 1, "write": 2, "admin": 3}
+# "anyone" is for redeeming an invite: the whole point is that the caller is
+# not a member yet, so it requires an identity and stops there.
+NEEDS = {"anyone": 0, "read": 1, "write": 2, "admin": 3}
+
+INVITE_SEPARATOR = ":"      # not in PROJECT_NAME, so a code always splits cleanly
+MAX_INVITE_DAYS = 30
+MAX_EMAIL = 200
 
 # Columns added after the first release. CREATE TABLE IF NOT EXISTS silently
 # leaves an existing table alone, so they have to be added explicitly.
@@ -411,6 +433,9 @@ def authorise(need: str) -> str | None:
 
     with closing(connect()) as conn:
         role = claim_membership(conn, identity)
+
+    if NEEDS[need] == 0:
+        return None          # being someone is the whole requirement
 
     if role is None:
         # Deliberately the same answer as a project that does not exist. This
@@ -1213,6 +1238,271 @@ def list_projects() -> str:
     if empty:
         text += f"\n\n({len(empty)} empty: {', '.join(empty)})"
     return text
+
+
+# --------------------------------------------------------------------------
+# Sharing
+# --------------------------------------------------------------------------
+
+
+def normalise_email(value: str) -> str:
+    return value.strip().lower()
+
+
+def check_role(role: str) -> str | None:
+    if role not in ROLES:
+        return f"Error: role must be one of {', '.join(ROLES)} (got {role!r})."
+    return None
+
+
+def owner_count(conn: sqlite3.Connection) -> int:
+    return conn.execute("SELECT COUNT(*) FROM members WHERE role = 'owner'").fetchone()[0]
+
+
+def describe_member(row: sqlite3.Row) -> str:
+    who = row["email"] or row["subject"]
+    state = "" if row["subject"] else "  (invited — has not signed in yet)"
+    return f"  {row['role']:<7} {who}{state}"
+
+
+@mcp.tool()
+def share_project(email: str, role: str = "member", project: str = "") -> str:
+    """Give someone access to this project, by email address.
+
+    They do not need an account yet. The invitation is recorded against the
+    address and takes effect the first time they sign in with it.
+
+    Args:
+        email: The address they will sign in with.
+        role: viewer reads; member also logs and supersedes decisions and
+            retires their own; owner also manages access and can retire
+            anyone's. Defaults to member.
+        project: Which project to act on. Required only on the router
+            connector (a URL with no /p/<project>/ in it); omit it everywhere
+            else.
+    """
+    with scoped(project, need="admin") as problem:
+        return problem or _share_project(email, role)
+
+
+def _share_project(email: str, role: str) -> str:
+    address = normalise_email(email)
+    if not address or "@" not in address:
+        return f"Error: {email!r} is not an email address."
+    if len(address) > MAX_EMAIL:
+        return f"Error: email is longer than {MAX_EMAIL} characters."
+    problem = check_role(role)
+    if problem:
+        return problem
+
+    with closing(connect()) as conn, writing(conn):
+        row = conn.execute(
+            "SELECT id, role, subject FROM members WHERE lower(email) = ?", (address,)
+        ).fetchone()
+        if row:
+            if row["role"] == role:
+                return f"{address} is already a {role} on {project_label()}."
+            # Demoting the last owner would leave the project unreachable.
+            if row["role"] == "owner" and role != "owner" and owner_count(conn) == 1:
+                return (
+                    f"Error: {address} is the only owner of {project_label()}. "
+                    "Make somebody else an owner first, or the project ends up "
+                    "with nobody who can manage it."
+                )
+            conn.execute("UPDATE members SET role = ? WHERE id = ?", (role, row["id"]))
+            return f"{address} is now a {role} on {project_label()} (was {row['role']})."
+        conn.execute(
+            "INSERT INTO members (subject, email, role, added_at, added_by)"
+            " VALUES (NULL, ?, ?, ?, ?)",
+            (address, role, now(), IDENTITY.get().label if IDENTITY.get() else None),
+        )
+    return (
+        f"Invited {address} to {project_label()} as {role}. They get access the "
+        "first time they sign in with that address."
+    )
+
+
+@mcp.tool()
+def list_members(project: str = "") -> str:
+    """Who can reach this project, and what they can do.
+
+    Args:
+        project: Which project to act on. Required only on the router
+            connector (a URL with no /p/<project>/ in it); omit it everywhere
+            else.
+    """
+    with scoped(project, need="read") as problem:
+        return problem or _list_members()
+
+
+def _list_members() -> str:
+    with closing(connect()) as conn:
+        rows = list(conn.execute(
+            "SELECT * FROM members ORDER BY CASE role"
+            " WHEN 'owner' THEN 0 WHEN 'member' THEN 1 ELSE 2 END, lower(email), id"
+        ))
+        pending = conn.execute(
+            "SELECT COUNT(*) FROM invites WHERE redeemed_at IS NULL AND expires_at > ?",
+            (now(),),
+        ).fetchone()[0]
+    if not rows:
+        return f"{project_label()} has no members recorded."
+    lines = [f"# Access — {project_label()}", ""]
+    lines += [describe_member(r) for r in rows]
+    if pending:
+        lines.append("")
+        lines.append(f"({pending} unredeemed invite link(s) outstanding.)")
+    return "\n".join(lines)
+
+
+@mcp.tool()
+def revoke_access(email: str, project: str = "") -> str:
+    """Remove someone's access to this project.
+
+    Decisions they logged stay in the history — the log is append-only, and
+    who made a call remains true after they leave.
+
+    Args:
+        email: The address they were added with.
+        project: Which project to act on. Required only on the router
+            connector (a URL with no /p/<project>/ in it); omit it everywhere
+            else.
+    """
+    with scoped(project, need="admin") as problem:
+        return problem or _revoke_access(email)
+
+
+def _revoke_access(email: str) -> str:
+    address = normalise_email(email)
+    with closing(connect()) as conn, writing(conn):
+        row = conn.execute(
+            "SELECT id, role FROM members WHERE lower(email) = ?", (address,)
+        ).fetchone()
+        if row is None:
+            return f"Error: {address} is not on {project_label()}."
+        if row["role"] == "owner" and owner_count(conn) == 1:
+            return (
+                f"Error: {address} is the only owner of {project_label()}. "
+                "Removing them would leave nobody able to manage it — make "
+                "somebody else an owner first."
+            )
+        conn.execute("DELETE FROM members WHERE id = ?", (row["id"],))
+    return f"Removed {address} from {project_label()}. Their decisions stay in the history."
+
+
+@mcp.tool()
+def create_invite(role: str = "member", expires_in_days: int = 7, project: str = "") -> str:
+    """Create a one-time invite code for someone whose address you do not know.
+
+    Use share_project instead when you know the address — an invite code works
+    for whoever holds it, so it is the weaker of the two.
+
+    Args:
+        role: viewer, member or owner. Defaults to member.
+        expires_in_days: How long the code stays valid, up to 30. Defaults to 7.
+        project: Which project to act on. Required only on the router
+            connector (a URL with no /p/<project>/ in it); omit it everywhere
+            else.
+    """
+    with scoped(project, need="admin") as problem:
+        return problem or _create_invite(role, expires_in_days)
+
+
+def _create_invite(role: str, expires_in_days: int) -> str:
+    problem = check_role(role)
+    if problem:
+        return problem
+    if not 1 <= expires_in_days <= MAX_INVITE_DAYS:
+        return f"Error: expires_in_days must be between 1 and {MAX_INVITE_DAYS}."
+
+    secret = secrets.token_urlsafe(24)
+    expires = (
+        datetime.now(timezone.utc) + timedelta(days=expires_in_days)
+    ).isoformat(timespec="seconds")
+    with closing(connect()) as conn, writing(conn):
+        conn.execute(
+            "INSERT INTO invites (code_hash, role, created_at, created_by, expires_at)"
+            " VALUES (?, ?, ?, ?, ?)",
+            (
+                hash_code(secret),
+                role,
+                now(),
+                IDENTITY.get().label if IDENTITY.get() else None,
+                expires,
+            ),
+        )
+    code = f"{REMOTE_PROJECT.get()}{INVITE_SEPARATOR}{secret}"
+    return (
+        f"Invite code for {project_label()} as {role}, valid until {expires[:10]}:\n\n"
+        f"    {code}\n\n"
+        "Send it to them and have them call redeem_invite with it. It works "
+        "once, for whoever uses it first, so send it somewhere only they can "
+        "read. This is the only time it is shown — only its hash is stored."
+    )
+
+
+def hash_code(secret: str) -> str:
+    return hashlib.sha256(secret.encode()).hexdigest()
+
+
+@mcp.tool()
+def redeem_invite(code: str) -> str:
+    """Accept an invite code somebody sent you, joining their project.
+
+    Args:
+        code: The whole code, including the project name before the colon.
+    """
+    name, _, secret = code.strip().partition(INVITE_SEPARATOR)
+    if not secret or not PROJECT_NAME.match(name):
+        return INVITE_REFUSED
+    pinned = REMOTE_PROJECT.get()
+    if pinned is not None and pinned != name:
+        return (
+            f"Error: this connector is pinned to {pinned}, but that code is for "
+            f"{name}. Redeem it on a connector for {name}, or on the router (/mcp)."
+        )
+    # need="anyone" because not being a member yet is the entire situation.
+    with scoped("" if pinned is not None else name, need="anyone") as problem:
+        return problem or _redeem_invite(secret)
+
+
+# One answer for expired, already used, and never existed. Telling them apart
+# tells whoever is guessing which guesses were close.
+INVITE_REFUSED = (
+    "Error: that invite code is not valid. It may have expired, or already "
+    "been used — they work once. Ask whoever sent it for a new one."
+)
+
+
+def _redeem_invite(secret: str) -> str:
+    identity = IDENTITY.get()
+    with closing(connect()) as conn, writing(conn):
+        row = conn.execute(
+            "SELECT * FROM invites WHERE code_hash = ?", (hash_code(secret),)
+        ).fetchone()
+        if row is None or row["redeemed_at"] or row["expires_at"] <= now():
+            return INVITE_REFUSED
+
+        existing = conn.execute(
+            "SELECT role FROM members WHERE subject = ? OR lower(email) = ?",
+            (identity.subject, (identity.email or "\x00")),
+        ).fetchone()
+        if existing:
+            return f"You are already a {existing['role']} on {project_label()}."
+
+        conn.execute(
+            "UPDATE invites SET redeemed_at = ?, redeemed_by = ? WHERE id = ?",
+            (now(), identity.label, row["id"]),
+        )
+        conn.execute(
+            "INSERT INTO members (subject, email, role, added_at, added_by)"
+            " VALUES (?, ?, ?, ?, 'invite')",
+            (identity.subject, identity.email or None, row["role"], now()),
+        )
+    return (
+        f"You are now a {row['role']} on {project_label()}. "
+        "Call get_project_brief to catch up on what has been decided."
+    )
 
 
 @mcp.tool()
