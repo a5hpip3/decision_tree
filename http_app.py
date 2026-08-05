@@ -438,6 +438,19 @@ async def _api_route(scope, receive, send, path):
         await JSONResponse(api.projects_payload())(scope, receive, send)
         return
 
+    if len(parts) == 2 and parts[0] == "invites":
+        # The invited person's own view of their invitation, for the page that
+        # walks them from a link to a working connector.
+        identity = server.IDENTITY.get()
+        details = server.invite_details(parts[1], identity) if identity else None
+        if details is None:
+            await JSONResponse({"error": "invalid invite"}, status_code=404)(
+                scope, receive, send
+            )
+            return
+        await JSONResponse(details)(scope, receive, send)
+        return
+
     if len(parts) == 3 and parts[0] == "projects" and parts[2] == "decisions":
         name = parts[1]
         # Check existence first: server.connect() creates the file, so reading
@@ -458,7 +471,11 @@ async def _api_route(scope, receive, send, path):
     await JSONResponse(
         {
             "error": "not found",
-            "routes": ["/api/projects", "/api/projects/{name}/decisions"],
+            "routes": [
+                "/api/projects",
+                "/api/projects/{name}/decisions",
+                "/api/invites/{code}",
+            ],
         },
         status_code=404,
     )(scope, receive, send)

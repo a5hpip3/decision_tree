@@ -438,3 +438,173 @@ class TestAssetCacheBusting:
         first = web_module.asset_version()
         (tmp_path / "index.html").write_text("<style>.a{color:red}</style>")
         assert web_module.asset_version() != first
+
+
+class TestInvitePage:
+    """The page that turns an invitation into a working connector.
+
+    Being granted access is not the same as knowing you have it. Somebody
+    invited by address has no account, no idea the project exists and nothing
+    telling them what to install, so the grant sat there doing nothing until
+    someone explained it by hand.
+    """
+
+    CODE = "acme:" + "a" * 32
+
+    def _visit(self, code, handler=None, signed_in=True, **overrides):
+        from starlette.routing import Route
+
+        async def default(request):
+            return JSONResponse(
+                {"project": "acme", "role": "member", "member": True, "spent": False}
+            )
+
+        async def scenario():
+            import httpx2
+            from starlette.applications import Starlette
+
+            upstream = Starlette(routes=[Route("/api/{rest:path}", handler or default)])
+            async with Server(upstream) as vault_srv:
+                application = web.build_app(
+                    config(VAULT_API_URL=f"http://127.0.0.1:{vault_srv.port}", **overrides),
+                    oauth=FakeAuth0({"email": "ash@example.com"}),
+                )
+                async with Server(application) as srv:
+                    async with httpx2.AsyncClient(follow_redirects=False) as client:
+                        base = f"http://127.0.0.1:{srv.port}"
+                        if signed_in:
+                            await client.get(f"{base}/auth/callback")
+                        return await client.get(f"{base}/invite/{code}")
+
+        return run(scenario())
+
+    def test_a_signed_out_visitor_is_sent_to_sign_in(self):
+        """They may not have an account at all — that is the normal case."""
+        response = self._visit(self.CODE, signed_in=False)
+        assert response.status_code in (302, 307)
+        assert response.headers["location"] == "/login"
+
+    def test_and_comes_back_to_the_invitation_afterwards(self):
+        """Landing on an empty dashboard would lose the instructions entirely."""
+        from starlette.routing import Route
+
+        async def handler(request):
+            return JSONResponse(
+                {"project": "acme", "role": "member", "member": True, "spent": False}
+            )
+
+        async def scenario():
+            import httpx2
+            from starlette.applications import Starlette
+
+            upstream = Starlette(routes=[Route("/api/{rest:path}", handler)])
+            async with Server(upstream) as vault_srv:
+                application = web.build_app(
+                    config(VAULT_API_URL=f"http://127.0.0.1:{vault_srv.port}"),
+                    oauth=FakeAuth0({"email": "ash@example.com"}),
+                )
+                async with Server(application) as srv:
+                    async with httpx2.AsyncClient(follow_redirects=False) as client:
+                        base = f"http://127.0.0.1:{srv.port}"
+                        await client.get(f"{base}/invite/{self.CODE}")   # remembers
+                        return await client.get(f"{base}/auth/callback")
+
+        assert run(scenario()).headers["location"] == f"/invite/{self.CODE}"
+
+    def test_it_names_the_project_and_the_role(self):
+        body = self._visit(self.CODE).text
+        assert "acme" in body and "member" in body
+
+    def test_it_gives_both_sets_of_connection_instructions(self):
+        body = self._visit(self.CODE).text
+        assert "claude mcp add" in body
+        assert "/p/acme/mcp" in body           # Claude Code, pinned
+        assert "/mcp" in body                  # chat, via the router
+
+    def test_it_warns_off_the_header_that_breaks_sign_in(self):
+        assert "Authorization header" in self._visit(self.CODE).text
+
+    def test_a_refused_invitation_says_so_without_saying_whose(self):
+        async def handler(request):
+            return JSONResponse({"error": "invalid invite"}, status_code=404)
+
+        response = self._visit(self.CODE, handler)
+        assert response.status_code == 404
+        assert "not valid" in response.text
+        # The address it was meant for is exactly what must not leak.
+        assert "example.invalid" not in response.text
+
+    def test_a_malformed_code_never_reaches_the_vault(self):
+        async def handler(request):          # noqa: ARG001
+            raise AssertionError("should not have been called")
+
+        assert self._visit("not-a-code", handler).status_code == 400
+
+    def test_an_unreachable_vault_is_not_a_stack_trace(self):
+        async def scenario():
+            import httpx2
+
+            application = web.build_app(
+                config(VAULT_API_URL="http://127.0.0.1:9"),
+                oauth=FakeAuth0({"email": "ash@example.com"}),
+            )
+            async with Server(application) as srv:
+                async with httpx2.AsyncClient(follow_redirects=False) as client:
+                    base = f"http://127.0.0.1:{srv.port}"
+                    await client.get(f"{base}/auth/callback")
+                    return await client.get(f"{base}/invite/{self.CODE}")
+
+        response = run(scenario())
+        assert response.status_code == 502
+        assert "Something is down" in response.text
+
+    def test_a_viewer_is_told_what_a_viewer_can_do(self):
+        async def handler(request):
+            return JSONResponse(
+                {"project": "acme", "role": "viewer", "member": True, "spent": False}
+            )
+
+        body = self._visit(self.CODE, handler).text
+        assert "read the full decision history" in body
+        assert "log decisions" not in body
+
+
+class TestOpenRedirect:
+    """`after_login` comes off a URL, so it is somebody else's input."""
+
+    def _callback_with(self, destination):
+        async def scenario():
+            import httpx2
+
+            application = web.build_app(
+                config(), oauth=FakeAuth0({"email": "ash@example.com"})
+            )
+            async with Server(application) as srv:
+                async with httpx2.AsyncClient(follow_redirects=False) as client:
+                    base = f"http://127.0.0.1:{srv.port}"
+                    await client.get(f"{base}/invite/{destination}")
+                    return await client.get(f"{base}/auth/callback")
+
+        return run(scenario())
+
+    @pytest.mark.parametrize("code", ["acme:" + "b" * 20])
+    def test_a_valid_code_round_trips(self, code):
+        assert self._callback_with(code).headers["location"] == f"/invite/{code}"
+
+    def test_a_rejected_code_leaves_no_destination_behind(self):
+        """A malformed code is refused before anything is remembered."""
+        assert self._callback_with("//evil.example.com").headers["location"] == "/"
+
+    @pytest.mark.parametrize("hostile", [
+        "//evil.example.com",
+        "https://evil.example.com",
+        "http://evil.example.com/x",
+        "///evil.example.com",
+        "", None,
+    ])
+    def test_only_a_path_on_this_service_is_honoured(self, hostile):
+        """The check itself, not just the one caller that happens to feed it."""
+        assert web.safe_destination(hostile) == "/"
+
+    def test_an_ordinary_path_is_kept(self):
+        assert web.safe_destination("/invite/acme:abc") == "/invite/acme:abc"

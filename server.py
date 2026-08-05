@@ -81,6 +81,7 @@ CREATE TABLE IF NOT EXISTS meta (
 CREATE TABLE IF NOT EXISTS invites (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     code_hash   TEXT NOT NULL UNIQUE,
+    email       TEXT,
     role        TEXT NOT NULL,
     created_at  TEXT NOT NULL,
     created_by  TEXT,
@@ -114,18 +115,26 @@ NEEDS = {"anyone": 0, "read": 1, "write": 2, "admin": 3}
 INVITE_SEPARATOR = ":"      # not in PROJECT_NAME, so a code always splits cleanly
 MAX_INVITE_DAYS = 30
 MAX_EMAIL = 200
+# How long a link mailed to a named person stays useful. Longer than an open
+# code because it admits only that address, so a stale one is not a loose end.
+SHARE_LINK_DAYS = 30
 
 # Columns added after the first release. CREATE TABLE IF NOT EXISTS silently
 # leaves an existing table alone, so they have to be added explicitly.
-ADDED_COLUMNS = (
-    ("retired_at", "TEXT"),
-    ("retired_reason", "TEXT"),
-    ("derives_from", "INTEGER"),
-    ("cluster", "TEXT"),
-    ("source", "TEXT"),
-    ("ref", "TEXT"),
-    ("author", "TEXT"),
-)
+ADDED_COLUMNS = {
+    "decisions": (
+        ("retired_at", "TEXT"),
+        ("retired_reason", "TEXT"),
+        ("derives_from", "INTEGER"),
+        ("cluster", "TEXT"),
+        ("source", "TEXT"),
+        ("ref", "TEXT"),
+        ("author", "TEXT"),
+    ),
+    # An invite carrying an address is one sent to a named person. It only
+    # admits that person, so the link is safe to forward.
+    "invites": (("email", "TEXT"),),
+}
 
 # Where the decision was made. Kept small on purpose: a free-text field would
 # fragment into synonyms and stop being a usable filter.
@@ -715,13 +724,15 @@ def migrate(conn: sqlite3.Connection) -> None:
     Vaults are long-lived files on disk and predate columns added later, so a
     missing column is normal, not an error.
     """
-    existing = {row["name"] for row in conn.execute("PRAGMA table_info(decisions)")}
-    missing = [(name, decl) for name, decl in ADDED_COLUMNS if name not in existing]
-    if not missing:
+    pending = []
+    for table, columns in ADDED_COLUMNS.items():
+        existing = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
+        pending += [(table, n, d) for n, d in columns if n not in existing]
+    if not pending:
         return
     with writing(conn):
-        for name, decl in missing:
-            conn.execute(f"ALTER TABLE decisions ADD COLUMN {name} {decl}")
+        for table, name, decl in pending:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {decl}")
 
 
 def capture_hints(conn: sqlite3.Connection, new_id: int, cluster: str, parent) -> str:
@@ -1255,6 +1266,38 @@ def check_role(role: str) -> str | None:
     return None
 
 
+def mint_invite(conn: sqlite3.Connection, role: str, days: int, email: str | None) -> str:
+    """Record an invite and return the code, which is shown exactly once."""
+    secret = secrets.token_urlsafe(24)
+    expires = (
+        datetime.now(timezone.utc) + timedelta(days=days)
+    ).isoformat(timespec="seconds")
+    conn.execute(
+        "INSERT INTO invites (code_hash, email, role, created_at, created_by, expires_at)"
+        " VALUES (?, ?, ?, ?, ?, ?)",
+        (
+            hash_code(secret),
+            email,
+            role,
+            now(),
+            IDENTITY.get().label if IDENTITY.get() else None,
+            expires,
+        ),
+    )
+    return f"{REMOTE_PROJECT.get()}{INVITE_SEPARATOR}{secret}"
+
+
+def invite_link(code: str) -> str | None:
+    """The page that walks an invited person from nothing to connected.
+
+    None when the front-end's address is not configured, in which case the
+    caller is given the bare code — the invitation still works, it just has no
+    page to explain itself on.
+    """
+    base = (os.environ.get("CONTEXT_VAULT_WEB_URL") or "").strip().rstrip("/")
+    return f"{base}/invite/{code}" if base else None
+
+
 def owner_count(conn: sqlite3.Connection) -> int:
     return conn.execute("SELECT COUNT(*) FROM members WHERE role = 'owner'").fetchone()[0]
 
@@ -1316,9 +1359,22 @@ def _share_project(email: str, role: str) -> str:
             " VALUES (NULL, ?, ?, ?, ?)",
             (address, role, now(), IDENTITY.get().label if IDENTITY.get() else None),
         )
+        code = mint_invite(conn, role, SHARE_LINK_DAYS, address)
+
+    link = invite_link(code)
+    if link is None:
+        return (
+            f"Invited {address} to {project_label()} as {role}. They get access "
+            "the first time they sign in with that address."
+        )
     return (
-        f"Invited {address} to {project_label()} as {role}. They get access the "
-        "first time they sign in with that address."
+        f"Invited {address} to {project_label()} as {role}.\n\n"
+        "Send them this link — it is how they find out, sign in and connect:\n\n"
+        f"    {link}\n\n"
+        f"It only works for {address}, so forwarding it grants nobody else "
+        "anything, and it walks them through signing in and connecting their "
+        "own Claude. Access is granted either way — the link is how they "
+        "discover it."
     )
 
 
@@ -1342,7 +1398,8 @@ def _list_members() -> str:
             " WHEN 'owner' THEN 0 WHEN 'member' THEN 1 ELSE 2 END, lower(email), id"
         ))
         pending = conn.execute(
-            "SELECT COUNT(*) FROM invites WHERE redeemed_at IS NULL AND expires_at > ?",
+            "SELECT COUNT(*) FROM invites"
+            " WHERE email IS NULL AND redeemed_at IS NULL AND expires_at > ?",
             (now(),),
         ).fetchone()[0]
     if not rows:
@@ -1415,30 +1472,52 @@ def _create_invite(role: str, expires_in_days: int) -> str:
     if not 1 <= expires_in_days <= MAX_INVITE_DAYS:
         return f"Error: expires_in_days must be between 1 and {MAX_INVITE_DAYS}."
 
-    secret = secrets.token_urlsafe(24)
-    expires = (
-        datetime.now(timezone.utc) + timedelta(days=expires_in_days)
-    ).isoformat(timespec="seconds")
     with closing(connect()) as conn, writing(conn):
-        conn.execute(
-            "INSERT INTO invites (code_hash, role, created_at, created_by, expires_at)"
-            " VALUES (?, ?, ?, ?, ?)",
-            (
-                hash_code(secret),
-                role,
-                now(),
-                IDENTITY.get().label if IDENTITY.get() else None,
-                expires,
-            ),
-        )
-    code = f"{REMOTE_PROJECT.get()}{INVITE_SEPARATOR}{secret}"
+        code = mint_invite(conn, role, expires_in_days, None)
+
+    link = invite_link(code)
     return (
-        f"Invite code for {project_label()} as {role}, valid until {expires[:10]}:\n\n"
-        f"    {code}\n\n"
-        "Send it to them and have them call redeem_invite with it. It works "
-        "once, for whoever uses it first, so send it somewhere only they can "
-        "read. This is the only time it is shown — only its hash is stored."
+        f"Invite to {project_label()} as {role}, valid for {expires_in_days} day(s):\n\n"
+        f"    {link or code}\n\n"
+        "This one works for whoever uses it first, so send it somewhere only "
+        "they can read — prefer share_project when you know the address. It is "
+        "shown once; only its hash is stored."
     )
+
+
+def invite_details(code: str, identity: "Identity") -> dict | None:
+    """What an invited person is allowed to be told about their invitation.
+
+    Read-only and deliberately thin: the project, the role, and whether this is
+    their invitation. Nothing about who else is on the project, and nothing at
+    all unless the invite is theirs — a link that got forwarded must not tell
+    the finder whose it was.
+
+    Returns None for anything unusable, so expired, spent and invented are one
+    answer here as they are everywhere else.
+    """
+    name, _, secret = (code or "").strip().partition(INVITE_SEPARATOR)
+    if not secret or not PROJECT_NAME.match(name) or name not in remote_projects():
+        return None
+    token = REMOTE_PROJECT.set(name)
+    try:
+        with closing(connect()) as conn:
+            row = conn.execute(
+                "SELECT * FROM invites WHERE code_hash = ?", (hash_code(secret),)
+            ).fetchone()
+            if row is None or row["expires_at"] <= now():
+                return None
+            if row["email"] and normalise_email(row["email"]) != (identity.email or ""):
+                return None
+            role = claim_membership(conn, identity)
+        return {
+            "project": name,
+            "role": role or row["role"],
+            "member": role is not None,
+            "spent": bool(row["redeemed_at"]),
+        }
+    finally:
+        REMOTE_PROJECT.reset(token)
 
 
 def hash_code(secret: str) -> str:
@@ -1481,6 +1560,11 @@ def _redeem_invite(secret: str) -> str:
             "SELECT * FROM invites WHERE code_hash = ?", (hash_code(secret),)
         ).fetchone()
         if row is None or row["redeemed_at"] or row["expires_at"] <= now():
+            return INVITE_REFUSED
+
+        if row["email"] and normalise_email(row["email"]) != (identity.email or ""):
+            # Sent to a named person. Saying so would leak their address to
+            # whoever the link got forwarded to.
             return INVITE_REFUSED
 
         existing = conn.execute(

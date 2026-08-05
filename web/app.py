@@ -56,6 +56,9 @@ ALLOWED_API_PATHS = (
     re.compile(r"^/api/projects/[a-z0-9][a-z0-9._-]{0,63}/decisions$"),
 )
 
+# An invite code, as it appears in a link: project, a colon, the secret.
+INVITE_CODE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}:[A-Za-z0-9_-]{16,128}$")
+
 
 class Config:
     def __init__(self, env=None):
@@ -135,6 +138,127 @@ def unseal(secret: str, value: str) -> str | None:
         return None
 
 
+def safe_destination(value: str | None) -> str:
+    """Where to send somebody after sign-in, from a remembered value.
+
+    Only ever a path on this service. What goes into the session today is built
+    from a validated invite code, so nothing hostile can reach here — but a
+    post-login redirect is the classic way to hand somebody a fresh session on
+    an attacker's page, and the check costs a line.
+    """
+    if not value or not value.startswith("/") or value.startswith("//"):
+        return "/"
+    return value
+
+
+def invite_page(details: dict | None, user: dict | None, problem: str | None) -> str:
+    """The one page an invited person sees, and the only instructions they get.
+
+    Written as a single self-contained document rather than through the graph
+    front-end: whoever is reading it has just arrived, may have made an account
+    thirty seconds ago, and needs one thing — how to connect. Sending them to a
+    dashboard first would bury it.
+    """
+    import html
+
+    vault = html.escape(os.environ.get("VAULT_API_URL", "").strip().rstrip("/"))
+    signed_in = html.escape((user or {}).get("email") or "")
+
+    if problem or not details:
+        headline, body = {
+            "malformed": ("That link is not right",
+                          "It looks incomplete — check you copied the whole thing."),
+            "unreachable": ("Something is down",
+                            "The vault could not be reached. Try again shortly."),
+        }.get(problem, (
+            "This invitation is not valid",
+            "It may have expired, already been used, or been meant for a "
+            f"different address. You are signed in as <strong>{signed_in}</strong> — "
+            "if that is not the address it was sent to, sign out and try again. "
+            "Otherwise ask whoever invited you for a new link.",
+        ))
+        return _shell(f"""
+          <h1>{html.escape(headline)}</h1>
+          <p class="lede">{body}</p>
+          <p><a class="btn" href="/logout">Sign out</a></p>
+        """)
+
+    project = html.escape(details["project"])
+    role = html.escape(details["role"])
+    can_write = details["role"] in ("member", "owner")
+    does = ("read the history, log decisions and supersede existing ones"
+            if can_write else "read the full decision history")
+
+    return _shell(f"""
+      <h1>You have access to <span class="project">{project}</span></h1>
+      <p class="lede">Signed in as <strong>{signed_in}</strong>, as
+         <strong>{role}</strong> — you can {does}.</p>
+
+      <p><a class="btn primary" href="/">Open the decision graph</a></p>
+
+      <h2>Connect your own Claude</h2>
+      <p>So decisions get logged where you are working, and carry your name.</p>
+
+      <h3>Claude (chat)</h3>
+      <ol>
+        <li>Settings &rarr; Connectors &rarr; <strong>Add custom connector</strong></li>
+        <li>URL: <code>{vault}/mcp</code></li>
+        <li>Leave the OAuth fields empty and connect — you will be asked to sign in.</li>
+      </ol>
+      <p class="note">One connector covers every project you are on; name the
+         project when you log a decision.</p>
+
+      <h3>Claude Code</h3>
+      <p>In the repo this project belongs to:</p>
+      <pre><code>claude mcp add --transport http decisiontree \
+  {vault}/p/{project}/mcp</code></pre>
+      <p>Then restart Claude Code, run <code>/mcp</code>, and authenticate.</p>
+      <p class="note"><strong>Do not add an Authorization header.</strong> A
+         configured header stops the client attempting sign-in at all, and it
+         fails with a 401 it cannot recover from.</p>
+    """)
+
+
+def _shell(body: str) -> str:
+    return f"""<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>DecisionTree — invitation</title>
+<style>
+  :root {{ color-scheme: light dark; --ink:#1C1917; --muted:#6b6259; --bg:#F4F0E8;
+           --card:#FFFDF9; --line:#E2DACD; --accent:#A85C3A; }}
+  @media (prefers-color-scheme: dark) {{
+    :root {{ --ink:#EDE7DA; --muted:#8B8377; --bg:#15140F; --card:#221F19;
+             --line:#302B23; --accent:#D08258; }}
+  }}
+  * {{ box-sizing: border-box; }}
+  body {{ margin:0; background:var(--bg); color:var(--ink);
+         font:16px/1.6 ui-serif, Georgia, serif; padding:6vh 5vw; }}
+  main {{ max-width:44rem; margin:0 auto; background:var(--card);
+          border:1px solid var(--line); border-radius:14px; padding:2.5rem; }}
+  h1 {{ font-size:1.6rem; margin:0 0 .5rem; line-height:1.25; }}
+  h2 {{ font-size:1.1rem; margin:2.2rem 0 .4rem;
+        border-top:1px solid var(--line); padding-top:1.6rem; }}
+  h3 {{ font-size:.78rem; letter-spacing:.14em; text-transform:uppercase;
+        color:var(--muted); margin:1.5rem 0 .4rem; }}
+  .project {{ color:var(--accent); }}
+  .lede {{ color:var(--muted); margin:0 0 1.4rem; }}
+  .note {{ color:var(--muted); font-size:.92rem; }}
+  code {{ font:13px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace;
+          background:var(--bg); border:1px solid var(--line);
+          border-radius:5px; padding:.1rem .35rem; }}
+  pre {{ background:var(--bg); border:1px solid var(--line); border-radius:8px;
+         padding:.9rem 1rem; overflow-x:auto; }}
+  pre code {{ border:0; background:none; padding:0; }}
+  ol {{ padding-left:1.2rem; }} li {{ margin:.25rem 0; }}
+  .btn {{ display:inline-block; text-decoration:none; color:var(--ink);
+          border:1px solid var(--line); border-radius:8px;
+          padding:.5rem 1rem; font-size:.9rem; }}
+  .btn.primary {{ background:var(--accent); border-color:var(--accent); color:#fff; }}
+</style></head>
+<body><main>{body}</main></body></html>"""
+
+
 def api_path_allowed(path: str) -> bool:
     return any(pattern.match(path) for pattern in ALLOWED_API_PATHS)
 
@@ -210,6 +334,46 @@ def build_app(config: Config | None = None, oauth=None) -> Starlette:
             return JSONResponse({"error": "not signed in"}, status_code=401)
         return JSONResponse({"email": user.get("email"), "name": user.get("name")})
 
+    async def invite(request):
+        """Turn an invitation into a working connector.
+
+        Being granted access is not the same as knowing you have it. Somebody
+        added by address has no account, no idea a project exists, and nothing
+        telling them what to install — so the grant sat there doing nothing
+        until somebody explained it to them by hand.
+
+        Signing in is required first, because the invitation belongs to an
+        address and only the sign-in proves which one this is.
+        """
+        code = request.path_params["code"]
+        if not INVITE_CODE.match(code):
+            return HTMLResponse(invite_page(None, None, "malformed"), status_code=400)
+
+        if current_user(request) is None:
+            # Remembered across the round trip through Auth0, so a first-time
+            # visitor lands back here rather than on an empty dashboard.
+            request.session["after_login"] = f"/invite/{code}"
+            return RedirectResponse("/login")
+
+        sealed = request.session.get("vault_token")
+        vault_token = unseal(config.session_secret, sealed) if sealed else None
+        headers = {"Authorization": f"Bearer {vault_token}"} if vault_token else {}
+        try:
+            async with httpx.AsyncClient(timeout=20) as client:
+                upstream = await client.get(
+                    f"{config.vault_url}/api/invites/{code}", headers=headers
+                )
+        except Exception as exc:  # noqa: BLE001
+            log.warning("invite: %s failed: %s", code, exc)
+            return HTMLResponse(invite_page(None, None, "unreachable"), status_code=502)
+
+        user = current_user(request)
+        if upstream.status_code != 200:
+            return HTMLResponse(
+                invite_page(None, user, "refused"), status_code=upstream.status_code
+            )
+        return HTMLResponse(invite_page(upstream.json(), user, None))
+
     async def login(request):
         if config.missing():
             return JSONResponse(
@@ -254,7 +418,9 @@ def build_app(config: Config | None = None, oauth=None) -> Starlette:
         request.session["vault_token"] = seal(config.session_secret, access_token)
         # Whether this person can see anything is the vault's answer, not ours.
         log.info("login: accepted %s", email)
-        return RedirectResponse("/")
+        # Only ever a path on this service, so a crafted value cannot bounce
+        # somebody to another host carrying a fresh session.
+        return RedirectResponse(safe_destination(request.session.pop("after_login", None)))
 
     async def logout(request):
         request.session.clear()
@@ -309,6 +475,7 @@ def build_app(config: Config | None = None, oauth=None) -> Starlette:
         Route("/auth/callback", callback, name="callback"),
         Route("/logout", logout),
         Route("/whoami", whoami),
+        Route("/invite/{code}", invite),
         Route("/api/{rest:path}", proxy),
         Route("/", index),
         Mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static"),

@@ -31,19 +31,29 @@ list_decisions = unwrap(server.list_decisions)
 get_project_brief = unwrap(server.get_project_brief)
 
 
+WEB = "https://web.example.com"
+
+
 @pytest.fixture
-def owned(vault):
-    """A hosted project whose only member is OWNER."""
+def owned(vault, monkeypatch):
+    """A hosted project whose only member is OWNER, with a front-end to link to."""
+    monkeypatch.setenv("CONTEXT_VAULT_WEB_URL", WEB)
     as_router(OWNER, log_decision, project="acme", create=True,
               summary="First", reasoning="r", excerpt="x")
     return "acme"
 
 
 def code_from(text: str) -> str:
-    """The invite code out of create_invite's response."""
+    """The invite code out of whatever an invite tool handed back.
+
+    Tolerates both shapes it comes in: a bare code when no front-end is
+    configured, and a link when there is one.
+    """
     for line in text.splitlines():
-        if server.INVITE_SEPARATOR in line and line.strip() and line.startswith("    "):
-            return line.strip()
+        stripped = line.strip()
+        if not line.startswith("    ") or server.INVITE_SEPARATOR not in stripped:
+            continue
+        return stripped.rsplit("/invite/", 1)[-1]
     raise AssertionError(f"no code in {text!r}")
 
 
@@ -305,3 +315,91 @@ class TestIsolation:
         code = code_from(hosted(owned, OWNER, create_invite))
         as_router(STRANGER, redeem_invite, code=code)
         assert "no project named" in hosted("other", STRANGER, list_decisions)
+
+
+# --------------------------------------------------------------------------
+# The link an invited person actually receives
+# --------------------------------------------------------------------------
+
+
+class TestInviteLink:
+    def test_share_project_hands_back_a_link(self, owned, monkeypatch):
+        out = hosted(owned, OWNER, share_project, email=MEMBER.email)
+        assert f"{WEB}/invite/acme:" in out
+
+    def test_without_a_configured_front_end_it_still_invites(self, owned, monkeypatch):
+        """The grant is the thing; the page only explains it."""
+        monkeypatch.delenv("CONTEXT_VAULT_WEB_URL", raising=False)
+        out = hosted(owned, OWNER, share_project, email=MEMBER.email)
+        assert "Invited" in out and "invite/" not in out
+        assert "First" in hosted(owned, MEMBER, list_decisions)
+
+    def test_the_link_only_works_for_the_address_it_names(self, owned):
+        """It gets forwarded. Forwarding it must grant nobody anything."""
+        code = code_from(hosted(owned, OWNER, share_project, email=MEMBER.email))
+        assert hosted(owned, STRANGER, redeem_invite, code=code) == server.INVITE_REFUSED
+        assert "no project named" in hosted(owned, STRANGER, list_decisions)
+
+    def test_a_bound_invite_is_not_an_outstanding_link(self, owned):
+        """It shows against the member row instead, where it means something."""
+        hosted(owned, OWNER, share_project, email=MEMBER.email)
+        out = hosted(owned, OWNER, list_members)
+        assert "unredeemed invite" not in out
+        assert "has not signed in yet" in out
+
+
+class TestInviteDetails:
+    """What the landing page is allowed to learn."""
+
+    def details(self, owned, identity, code):
+        return as_identity(identity, server.invite_details, code, identity)
+
+    def code_for(self, owned, email, role="member"):
+        return code_from(hosted(owned, OWNER, share_project, email=email, role=role))
+
+    def test_the_invited_person_sees_project_and_role(self, owned):
+        code = self.code_for(owned, MEMBER.email, "viewer")
+        assert self.details(owned, MEMBER, code) == {
+            "project": "acme", "role": "viewer", "member": True, "spent": False,
+        }
+
+    def test_somebody_else_sees_nothing(self, owned):
+        code = self.code_for(owned, MEMBER.email)
+        assert self.details(owned, STRANGER, code) is None
+
+    def test_an_open_code_tells_whoever_holds_it(self, owned):
+        code = code_from(hosted(owned, OWNER, create_invite))
+        assert self.details(owned, STRANGER, code)["project"] == "acme"
+
+    @pytest.mark.parametrize("bad", ["", "nocolon", "acme:", "no-such-project:abc"])
+    def test_unusable_codes_are_one_answer(self, owned, bad):
+        assert self.details(owned, MEMBER, bad) is None
+
+    def test_a_link_naming_nothing_does_not_conjure_a_vault(self, owned):
+        """connect() creates the file, so the name has to be checked first —
+        otherwise every mistyped link leaves an empty project behind."""
+        self.details(owned, MEMBER, "no-such-project:abcdefghijklmnop")
+        assert "no-such-project" not in server.remote_projects()
+
+    def test_an_expired_link_tells_nobody_anything(self, owned):
+        code = self.code_for(owned, MEMBER.email)
+        token = server.REMOTE_PROJECT.set(owned)
+        try:
+            with closing(server.connect()) as conn, server.writing(conn):
+                conn.execute("UPDATE invites SET expires_at = '2020-01-01T00:00:00+00:00'")
+        finally:
+            server.REMOTE_PROJECT.reset(token)
+        assert self.details(owned, MEMBER, code) is None
+
+    def test_looking_claims_the_membership(self, owned):
+        """Landing on the page is a sign-in, which is what the row was waiting for."""
+        code = self.code_for(owned, MEMBER.email)
+        self.details(owned, MEMBER, code)
+        row = [r for r in members_of(owned) if r["email"] == MEMBER.email][0]
+        assert row["subject"] == MEMBER.subject
+
+    def test_it_reports_the_role_actually_held(self, owned):
+        """Not the one the link was minted with, if an owner has since changed it."""
+        code = self.code_for(owned, MEMBER.email, "viewer")
+        hosted(owned, OWNER, share_project, email=MEMBER.email, role="member")
+        assert self.details(owned, MEMBER, code)["role"] == "member"

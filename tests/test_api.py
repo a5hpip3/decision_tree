@@ -240,6 +240,37 @@ class TestApiAuth:
         seed(vault, "proj", ["one"])
         assert self._get("/api/projects").status_code == 401
         assert self._get("/api/projects/proj/decisions").status_code == 401
+        # An invitation is somebody's, so reading one needs to be somebody.
+        assert self._get("/api/invites/proj:abcdefghijklmnop").status_code == 401
+
+    def test_an_unauthenticated_server_refuses_rather_than_crashes(self, vault):
+        """A local run has nobody to be, and an invitation belongs to someone.
+
+        Reaching the lookup with no identity at all would fail on the first
+        attribute access — a 500 where a 404 is the honest answer.
+        """
+        from contextlib import closing
+
+        seed(vault, "proj", ["one"])
+        # A real, live invitation, so the lookup gets past every early return
+        # and actually reaches the point where it wants to know who is asking.
+        token = server.REMOTE_PROJECT.set("proj")
+        try:
+            with closing(server.connect()) as conn, server.writing(conn):
+                code = server.mint_invite(conn, "member", 7, "invited@example.com")
+        finally:
+            server.REMOTE_PROJECT.reset(token)
+
+        async def scenario():
+            import httpx2
+
+            async with Server(http_app.build_app()) as srv:
+                async with httpx2.AsyncClient() as client:
+                    return await client.get(
+                        f"http://127.0.0.1:{srv.port}/api/invites/{code}"
+                    )
+
+        assert run(scenario()).status_code == 404
 
     def test_an_opaque_secret_is_refused(self, vault):
         seed(vault, "proj", ["one"])
