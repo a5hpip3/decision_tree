@@ -1343,8 +1343,6 @@ def _share_project(email: str, role: str) -> str:
             "SELECT id, role, subject FROM members WHERE lower(email) = ?", (address,)
         ).fetchone()
         if row:
-            if row["role"] == role:
-                return f"{address} is already a {role} on {project_label()}."
             # Demoting the last owner would leave the project unreachable.
             if row["role"] == "owner" and role != "owner" and owner_count(conn) == 1:
                 return (
@@ -1352,23 +1350,40 @@ def _share_project(email: str, role: str) -> str:
                     "Make somebody else an owner first, or the project ends up "
                     "with nobody who can manage it."
                 )
-            conn.execute("UPDATE members SET role = ? WHERE id = ?", (role, row["id"]))
-            return f"{address} is now a {role} on {project_label()} (was {row['role']})."
-        conn.execute(
-            "INSERT INTO members (subject, email, role, added_at, added_by)"
-            " VALUES (NULL, ?, ?, ?, ?)",
-            (address, role, now(), IDENTITY.get().label if IDENTITY.get() else None),
-        )
+            if row["role"] != role:
+                conn.execute("UPDATE members SET role = ? WHERE id = ?", (role, row["id"]))
+            headline = (
+                f"{address} is already a {role} on {project_label()}."
+                if row["role"] == role
+                else f"{address} is now a {role} on {project_label()} (was {row['role']})."
+            )
+            arrived = row["subject"] is not None
+        else:
+            conn.execute(
+                "INSERT INTO members (subject, email, role, added_at, added_by)"
+                " VALUES (NULL, ?, ?, ?, ?)",
+                (address, role, now(), IDENTITY.get().label if IDENTITY.get() else None),
+            )
+            headline = f"Invited {address} to {project_label()} as {role}."
+            arrived = False
+
+        # A fresh link every time, including for somebody already on the list:
+        # the first thing an owner does when asked "how do I get in?" is run
+        # this again, and having it answer "already a member" and nothing else
+        # leaves them with nothing to send.
         code = mint_invite(conn, role, SHARE_LINK_DAYS, address)
 
     link = invite_link(code)
     if link is None:
+        return f"{headline} They get access the first time they sign in with that address."
+    if arrived:
         return (
-            f"Invited {address} to {project_label()} as {role}. They get access "
-            "the first time they sign in with that address."
+            f"{headline}\n\n"
+            f"They have signed in already, so they are set up. If they need the "
+            f"instructions again:\n\n    {link}\n"
         )
     return (
-        f"Invited {address} to {project_label()} as {role}.\n\n"
+        f"{headline}\n\n"
         "Send them this link — it is how they find out, sign in and connect:\n\n"
         f"    {link}\n\n"
         f"It only works for {address}, so forwarding it grants nobody else "

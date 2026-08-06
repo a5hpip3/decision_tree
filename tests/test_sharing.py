@@ -109,9 +109,34 @@ class TestShareProject:
         assert "is now a member" in out and "was viewer" in out
         assert len(members_of(owned)) == 2
 
-    def test_sharing_at_the_same_role_is_a_no_op(self, owned):
+    def test_sharing_at_the_same_role_still_hands_back_a_link(self, owned):
+        """The first thing an owner does when asked "how do I get in?" is run
+        this again. Answering "already a member" and nothing else leaves them
+        with nothing to send, which is how the gap was found."""
         hosted(owned, OWNER, share_project, email=MEMBER.email)
-        assert "already a member" in hosted(owned, OWNER, share_project, email=MEMBER.email)
+        out = hosted(owned, OWNER, share_project, email=MEMBER.email)
+        assert "already a member" in out
+        assert f"{WEB}/invite/acme:" in out
+
+    def test_a_second_link_does_not_disturb_the_membership(self, owned):
+        hosted(owned, OWNER, share_project, email=MEMBER.email)
+        hosted(owned, OWNER, share_project, email=MEMBER.email)
+        rows = [r for r in members_of(owned) if r["email"] == MEMBER.email]
+        assert len(rows) == 1 and rows[0]["role"] == "member"
+
+    def test_both_links_work_for_the_person_they_name(self, owned):
+        """Reissuing must not quietly invalidate the one already sent."""
+        first = code_from(hosted(owned, OWNER, share_project, email=MEMBER.email))
+        second = code_from(hosted(owned, OWNER, share_project, email=MEMBER.email))
+        assert first != second
+        for code in (first, second):
+            assert as_identity(MEMBER, server.invite_details, code, MEMBER) is not None
+
+    def test_someone_who_has_arrived_is_told_so(self, owned):
+        hosted(owned, OWNER, share_project, email=MEMBER.email)
+        hosted(owned, MEMBER, list_decisions)          # they sign in
+        out = hosted(owned, OWNER, share_project, email=MEMBER.email)
+        assert "signed in already" in out
 
     def test_a_member_cannot_invite(self, owned):
         hosted(owned, OWNER, share_project, email=MEMBER.email)
