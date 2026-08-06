@@ -305,9 +305,7 @@ class TestOverHttp:
         base, responses = run(scenario())
         assert [r.status_code for r in responses] == [200, 200, 200, 200]
         resources = {r.json()["resource"] for r in responses}
-        assert resources == {base}, resources
-        # What the SDK will accept: the exact connect URL, or its origin.
-        assert not resources.pop().endswith("/mcp")
+        assert resources == {f"{base}/"}, resources
         assert responses[0].json()["authorization_servers"] == [
             "https://tenant.us.auth0.com/"
         ]
@@ -316,8 +314,11 @@ class TestOverHttp:
         """The check the MCP SDK makes before it will start a flow at all.
 
         It refused a shared identifier with a path on it: "Protected resource
-        .../mcp does not match expected .../p/hopscotch/mcp (or origin)".
+        .../mcp does not match expected .../p/hopscotch/mcp (or origin)". A
+        client compares origins, so the trailing slash is immaterial here — it
+        matters to the authorization server, which matches strings.
         """
+        from urllib.parse import urlsplit
 
         async def scenario():
             import httpx2
@@ -332,7 +333,38 @@ class TestOverHttp:
 
         base, advertised = run(scenario())
         connected_to = f"{base}/p/hopscotch/mcp"
-        assert advertised == connected_to or advertised == base
+        origin = lambda u: urlsplit(u)[:2]              # noqa: E731
+        assert advertised == connected_to or origin(advertised) == origin(base)
+
+    def test_the_advertised_resource_is_spelled_as_an_authorization_server_wants(
+        self, vault, keypair
+    ):
+        """And an authorization server matches the string, not the origin.
+
+        Clients disagree about the trailing slash: one turns the advertised
+        value into a URL before sending it, which adds the slash, and the other
+        sends it verbatim. Advertising the bare form therefore worked for one
+        and failed for the other with "not authorized to access resource
+        server" — which reads like a permissions problem and is a spelling one.
+        """
+
+        async def scenario():
+            import httpx2
+
+            async with Server(self._app(keypair)) as srv:
+                base = f"http://127.0.0.1:{srv.port}"
+                async with httpx2.AsyncClient() as client:
+                    doc = await client.get(
+                        f"{base}/.well-known/oauth-protected-resource/mcp"
+                    )
+                    return base, doc.json()["resource"]
+
+        base, advertised = run(scenario())
+        assert advertised == f"{base}/"
+        # Verbatim and URL-normalised both land on the registered identifier.
+        from urllib.parse import urljoin
+
+        assert urljoin(advertised, "") == advertised
 
     def test_a_token_for_the_server_works_on_any_project_endpoint(self, vault, keypair):
         """One audience, and membership decides which projects it reaches.

@@ -136,12 +136,21 @@ def canonical_resource(scope) -> str:
     The origin is the only value that is both shared across every project and
     acceptable to a client connecting to one. One API to register, once.
 
+    With the trailing slash, because clients do not agree on whether to add it.
+    Claude Code turns the advertised value into a URL before sending it back,
+    which appends the slash; the chat client sends it verbatim. An
+    authorization server matches an identifier exactly, so advertising the bare
+    form worked for the client that normalised it and failed for the one that
+    did not — and looked like a per-client permissions problem rather than a
+    spelling one. Advertising the slashed form is what the registered API
+    actually is, so both clients send something that matches.
+
     The per-project audience was load-bearing when holding a token was the same
     as being allowed in — it was what kept a token for one project out of
     another. Membership does that now, on every call, so scoping the audience
     as well was buying isolation that already existed.
     """
-    return request_origin(scope)
+    return f"{request_origin(scope)}/"
 
 
 def acceptable_resources(scope, project) -> list:
