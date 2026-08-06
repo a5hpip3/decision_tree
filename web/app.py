@@ -210,8 +210,7 @@ def invite_page(details: dict | None, user: dict | None, problem: str | None) ->
 
       <h3>Claude Code</h3>
       <p>In the repo this project belongs to:</p>
-      <pre><code>claude mcp add --transport http decisiontree \
-  {vault}/p/{project}/mcp</code></pre>
+      <pre><code>claude mcp add --transport http decisiontree {vault}/p/{project}/mcp</code></pre>
       <p>Then restart Claude Code, run <code>/mcp</code>, and authenticate.</p>
       <p class="note"><strong>Do not add an Authorization header.</strong> A
          configured header stops the client attempting sign-in at all, and it
@@ -247,8 +246,10 @@ def _shell(body: str) -> str:
   code {{ font:13px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace;
           background:var(--bg); border:1px solid var(--line);
           border-radius:5px; padding:.1rem .35rem; }}
+  /* Wrapped rather than scrolled: this is a command somebody has to copy, and
+     half of it parked off the right edge is half of it they will miss. */
   pre {{ background:var(--bg); border:1px solid var(--line); border-radius:8px;
-         padding:.9rem 1rem; overflow-x:auto; }}
+         padding:.9rem 1rem; white-space:pre-wrap; overflow-wrap:anywhere; }}
   pre code {{ border:0; background:none; padding:0; }}
   ol {{ padding-left:1.2rem; }} li {{ margin:.25rem 0; }}
   .btn {{ display:inline-block; text-decoration:none; color:var(--ink);

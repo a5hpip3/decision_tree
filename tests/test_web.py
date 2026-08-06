@@ -558,6 +558,16 @@ class TestInvitePage:
         assert response.status_code == 502
         assert "Something is down" in response.text
 
+    def test_the_command_is_one_copyable_line(self):
+        """A line-continuation backslash was being eaten by the escaping and
+        left in the middle of the command, and the block scrolled rather than
+        wrapped — so half of what you had to copy sat off the right edge."""
+        body = self._visit(self.CODE).text
+        command = [l for l in body.splitlines() if "claude mcp add" in l][0]
+        assert "\\" not in command
+        assert "/p/acme/mcp" in command
+        assert "white-space:pre-wrap" in body
+
     def test_a_viewer_is_told_what_a_viewer_can_do(self):
         async def handler(request):
             return JSONResponse(
